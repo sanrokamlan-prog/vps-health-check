@@ -214,6 +214,8 @@ if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
     exit 2
 fi
 
+# Called indirectly by the EXIT trap.
+# shellcheck disable=SC2317
 cleanup() {
     rm -rf -- "$TMP_DIR"
 }
@@ -289,23 +291,17 @@ add_ticket_fact() {
     TICKET_FACTS+=("$1")
 }
 
-capture_raw() {
-    local name="$1"
-    shift
-    "$@" >"$BUNDLE_DIR/raw/$name" 2>&1 || true
-}
-
 sample_cpu_contention() {
     [[ -r /proc/stat ]] || return 0
 
-    local cpu user nice system idle iowait irq softirq steal guest guest_nice
+    local _cpu user nice system idle iowait irq softirq steal _guest _guest_nice
     local total_1 total_2 steal_1 steal_2 iowait_1 iowait_2 delta_total
-    read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+    read -r _cpu user nice system idle iowait irq softirq steal _guest _guest_nice < /proc/stat
     total_1=$((user + nice + system + idle + iowait + irq + softirq + steal))
     steal_1=$steal
     iowait_1=$iowait
     sleep 2
-    read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+    read -r _cpu user nice system idle iowait irq softirq steal _guest _guest_nice < /proc/stat
     total_2=$((user + nice + system + idle + iowait + irq + softirq + steal))
     steal_2=$steal
     iowait_2=$iowait
@@ -333,6 +329,7 @@ check_system() {
 
     local os_name="unknown"
     if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
         os_name="$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-unknown}")"
     fi
     status_line INFO "$(tr_text '主机名' 'Hostname'): $host_name"
@@ -413,8 +410,8 @@ check_resources() {
     fi
 
     if command_exists df; then
-        local fs blocks used available capacity mount pct
-        while read -r fs blocks used available capacity mount; do
+        local fs _blocks _used _available capacity mount pct
+        while read -r fs _blocks _used _available capacity mount; do
             [[ "$capacity" =~ ^[0-9]+%$ ]] || continue
             pct="${capacity%%%}"
             if ((pct >= 95)); then
@@ -428,8 +425,8 @@ check_resources() {
             fi
         done < <(df -P -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | awk 'NR > 1')
 
-        local ifs inodes iused ifree icap imount ipct
-        while read -r ifs inodes iused ifree icap imount; do
+        local _ifs _inodes _iused _ifree icap imount ipct
+        while read -r _ifs _inodes _iused _ifree icap imount; do
             [[ "$icap" =~ ^[0-9]+%$ ]] || continue
             ipct="${icap%%%}"
             if ((ipct >= 95)); then
@@ -538,7 +535,8 @@ default_interface() {
 }
 
 read_counter() {
-    local iface="$1" counter="$2" file="/sys/class/net/$iface/statistics/$counter"
+    local iface="$1" counter="$2" file
+    file="/sys/class/net/$iface/statistics/$counter"
     if [[ -r "$file" ]]; then
         tr -cd '0-9' <"$file"
     else
@@ -705,6 +703,12 @@ import_probe_log() {
 build_recommendations() {
     section "$(tr_text '建议与下一步' 'Recommendations and next steps')"
 
+    if ((FLAG_HIGH_LOAD > 0)); then
+        add_recommendation \
+            "系统负载高于可用 CPU。先查看 evidence/raw/processes.txt 和 top，判断是本机进程占用还是 CPU steal 同时偏高；只有排除本机负载后，才应把方向转向宿主机争用。" \
+            "System load exceeds available CPU capacity. Review evidence/raw/processes.txt and top to distinguish guest workload from elevated CPU steal; investigate host contention only after guest load is ruled out."
+    fi
+
     if ((CPU_STEAL_PCT >= 5)); then
         add_recommendation \
             "CPU steal=${CPU_STEAL_PCT}%，这是宿主机 CPU 争用/超售的线索。先在不跑业务压测时重复检查 3 次；若持续偏高，把证据包提交 VPS 厂商，要求检查宿主机 CPU steal、负载和邻居实例争用。" \
@@ -813,8 +817,12 @@ collect_raw_evidence() {
         uname -a 2>/dev/null || true
         [[ -r /etc/os-release ]] && cat /etc/os-release
         uptime 2>/dev/null || true
-        command_exists systemd-detect-virt && systemd-detect-virt 2>/dev/null || true
-        command_exists last && last -x -F 2>/dev/null | head -n 30 || true
+        if command_exists systemd-detect-virt; then
+            systemd-detect-virt 2>/dev/null || true
+        fi
+        if command_exists last; then
+            last -x -F 2>/dev/null | head -n 30 || true
+        fi
     } >"$BUNDLE_DIR/raw/system.txt"
 
     {
@@ -824,19 +832,29 @@ collect_raw_evidence() {
         printf '\n-- df -i --\n'
         df -i 2>/dev/null || true
         printf '\n-- vmstat --\n'
-        command_exists vmstat && vmstat 1 3 2>/dev/null || true
+        if command_exists vmstat; then
+            vmstat 1 3 2>/dev/null || true
+        fi
         printf '\n-- top processes (arguments excluded) --\n'
         ps -eo pid,ppid,user,%cpu,%mem,stat,comm --sort=-%cpu 2>/dev/null | head -n 30 || true
     } >"$BUNDLE_DIR/raw/resources.txt"
 
     {
-        command_exists ip && ip address show 2>/dev/null || true
+        if command_exists ip; then
+            ip address show 2>/dev/null || true
+        fi
         printf '\n-- routes --\n'
-        command_exists ip && ip route show table all 2>/dev/null || true
+        if command_exists ip; then
+            ip route show table all 2>/dev/null || true
+        fi
         printf '\n-- link counters --\n'
-        command_exists ip && ip -s link show 2>/dev/null || true
+        if command_exists ip; then
+            ip -s link show 2>/dev/null || true
+        fi
         printf '\n-- socket summary --\n'
-        command_exists ss && ss -s 2>/dev/null || true
+        if command_exists ss; then
+            ss -s 2>/dev/null || true
+        fi
     } >"$BUNDLE_DIR/raw/network.txt"
 
     {
@@ -857,13 +875,13 @@ write_summary_markdown() {
     ((FAIL_COUNT == 0 && WARN_COUNT > 0)) && overall="WARN"
     {
         printf '# VPS Health Check Summary\n\n'
-        printf -- '- Host: `%s`\n' "$host_name"
-        printf -- '- Generated: `%s`\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
+        printf -- '- Host: %s\n' "$host_name"
+        printf -- '- Generated: %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
         printf -- '- Overall: **%s**\n' "$overall"
         printf -- '- Checks: PASS=%d, WARN=%d, FAIL=%d\n' "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
-        printf -- '- CPU steal sample: `%s%%`\n' "$CPU_STEAL_PCT"
-        printf -- '- CPU I/O wait sample: `%s%%`\n' "$CPU_IOWAIT_PCT"
-        printf -- '- External lost events imported: `%s`\n\n' "$PROBE_LOST_COUNT"
+        printf -- '- CPU steal sample: %s%%\n' "$CPU_STEAL_PCT"
+        printf -- '- CPU I/O wait sample: %s%%\n' "$CPU_IOWAIT_PCT"
+        printf -- '- External lost events imported: %s\n\n' "$PROBE_LOST_COUNT"
         printf '## Recommendations (Chinese)\n\n'
         for ((i = 0; i < ${#RECOMMENDATIONS_ZH[@]}; i++)); do
             printf '%d. %s\n' "$((i + 1))" "${RECOMMENDATIONS_ZH[$i]}"
