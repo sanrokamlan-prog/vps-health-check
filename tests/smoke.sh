@@ -8,7 +8,8 @@ TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
 
 bash -n "$SCRIPT"
-bash "$SCRIPT" --help | grep -q -- '--probe-log FILE'
+help_output="$(bash "$SCRIPT" --help)"
+grep -q -- '--probe-log FILE' <<<"$help_output"
 
 set +e
 bash "$SCRIPT" --hours invalid >/dev/null 2>&1
