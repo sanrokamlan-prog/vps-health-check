@@ -20,4 +20,4 @@ jobs:
       - name: Run ShellCheck
         run: shellcheck vps-health-check.sh tests/smoke.sh
       - name: Run smoke tests
-        run: bash -x tests/smoke.sh
+        run: bash tests/smoke.sh
