@@ -23,7 +23,11 @@ bash "$SCRIPT" --target 127.0.0.1 --hours 1 --probe-log "$ROOT_DIR/examples/prob
 run_rc=$?
 set -e
 [[ "$run_rc" -ge 0 && "$run_rc" -le 2 ]]
-[[ -s "$report" ]]
+if [[ ! -s "$report" ]]; then
+    printf 'snapshot report was not created; stderr follows:\n' >&2
+    cat "$TEST_DIR/stderr.txt" >&2
+    exit 1
+fi
 [[ ! -s "$TEST_DIR/stderr.txt" ]]
 
 bundle="${report%.*}-evidence"
