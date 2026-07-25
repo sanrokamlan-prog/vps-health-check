@@ -1,0 +1,43 @@
+name: Bug report
+description: Report a false positive, false negative, crash, or compatibility problem.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not post passwords, private keys, API tokens, or an unreviewed production evidence bundle.
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Debian 13, Ubuntu 24.04, AlmaLinux 10, etc.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Script version
+      placeholder: 1.0.0
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command used
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: sanitized_output
+    attributes:
+      label: Sanitized output
+      description: Remove public IPs, hostnames, and any sensitive details if necessary.
+      render: text

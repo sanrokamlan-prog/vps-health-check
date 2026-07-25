@@ -1,0 +1,5 @@
+*.log
+*-evidence/
+*-evidence.tar.gz
+.idea/
+.vscode/

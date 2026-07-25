@@ -1,0 +1,23 @@
+name: Shell checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check Bash syntax
+        run: bash -n vps-health-check.sh tests/smoke.sh
+      - name: Run ShellCheck
+        run: shellcheck vps-health-check.sh tests/smoke.sh
+      - name: Run smoke tests
+        run: bash tests/smoke.sh
