@@ -1089,7 +1089,7 @@ check_network_stack_and_ports() {
             for tcp_target in "${TCP_TARGETS[@]}"; do
                 host="${tcp_target%:*}"
                 port="${tcp_target##*:}"
-                if timeout 5 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$host" "$port" 2>/dev/null; then
+                if timeout 5 bash -c "exec 3<>/dev/tcp/\$1/\$2" _ "$host" "$port" 2>/dev/null; then
                     status_line PASS "$(tr_text '远端 TCP 端口可连接' 'Remote TCP port is reachable'): $tcp_target"
                 else
                     FLAG_TCP_TARGET=1
