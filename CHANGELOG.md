@@ -10,6 +10,8 @@ All notable changes are documented in this file.
 - Extended the unattended monitor with repeatable network targets, configurable consecutive-failure confirmation, target and overall `UP`/`DEGRADED`/`DOWN` events, and automatic outage/recovery network snapshots.
 - Added interface RX/TX rate heartbeats and outage evidence for routes, link counters, socket/TCP state, conntrack, qdisc, resolver state, and recent kernel warnings.
 - Required all configured targets to be down before recording an overall network outage, reducing false positives from one ICMP-filtered destination.
+- Added `timeline.md` and `timeline.tsv`, normalizing guest boot, external probe, background monitor, and foreground watch events into one VPS-local-time sequence.
+- Added schema-versioned `summary.json` with health counts, connectivity results, monitoring totals, key signals, and bilingual recommendations for agents and integrations.
 
 ## 1.2.0 - 2026-07-26
 

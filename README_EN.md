@@ -72,6 +72,8 @@ sudo bash /tmp/vps-health-check.sh --monitor-log /var/log/vps-health-monitor/mon
 The script creates a report and a compressed evidence bundle containing:
 
 - `summary.md`: findings and recommendations in Chinese and English;
+- `summary.json`: schema-versioned counts, signals, monitoring totals, and bilingual recommendations for agents or integrations;
+- `timeline.md` and `timeline.tsv`: guest-local-time alignment of boot, external probe, background monitor, and foreground watch events;
 - `report.txt`: the complete console report without ANSI colors;
 - `provider-ticket-en.txt`: an editable English provider ticket;
 - `review-prompt.txt`: a structured prompt for administrator or AI review;

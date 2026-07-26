@@ -110,6 +110,7 @@ RECOMMENDATIONS_ZH=()
 RECOMMENDATIONS_EN=()
 TICKET_FACTS=()
 ENDPOINT_EVIDENCE=()
+TIMELINE_EVENTS=()
 
 usage() {
     cat <<'EOF'
@@ -439,6 +440,24 @@ add_recommendation() {
 
 add_ticket_fact() {
     TICKET_FACTS+=("$1")
+}
+
+record_timeline_event() {
+    local epoch="$1" timestamp="$2" source="$3" event="$4" details="$5"
+    [[ "$epoch" =~ ^[0-9]+$ ]] || return 0
+    details="${details//$'\t'/ }"
+    details="${details//$'\r'/ }"
+    details="${details//$'\n'/ }"
+    TIMELINE_EVENTS+=("${epoch}"$'\t'"${timestamp}"$'\t'"${source}"$'\t'"${event}"$'\t'"${details}")
+}
+
+record_boot_timeline() {
+    local boot_time epoch normalized
+    boot_time="$(uptime -s 2>/dev/null || true)"
+    [[ -n "$boot_time" ]] || return 0
+    epoch="$(date -d "$boot_time" +%s 2>/dev/null || true)"
+    normalized="$(date -d "@$epoch" '+%F %T %z' 2>/dev/null || printf '%s' "$boot_time")"
+    record_timeline_event "$epoch" "$normalized" system BOOT "Current guest boot"
 }
 
 read_key_value() {
@@ -1422,11 +1441,57 @@ check_network_stack_and_ports() {
     check_remote_tcp_targets
 }
 
+record_probe_timeline() {
+    local file="$1" line date_part time_part zone event _rest sign hours zone_normalized epoch normalized event_upper
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        read -r date_part time_part zone event _rest <<<"$line"
+        [[ "$date_part" =~ ^[0-9]{4}[.-][0-9]{2}[.-][0-9]{2}$ && "$time_part" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || continue
+        date_part="${date_part//./-}"
+        zone_normalized="$zone"
+        if [[ "$zone" =~ ^UTC([+-])([0-9]{1,2})$ ]]; then
+            sign="${BASH_REMATCH[1]}"
+            hours=$((10#${BASH_REMATCH[2]}))
+            printf -v zone_normalized '%s%02d:00' "$sign" "$hours"
+        fi
+        epoch="$(date -d "$date_part $time_part $zone_normalized" +%s 2>/dev/null || true)"
+        [[ "$epoch" =~ ^[0-9]+$ ]] || continue
+        normalized="$(date -d "@$epoch" '+%F %T %z' 2>/dev/null || printf '%s %s %s' "$date_part" "$time_part" "$zone")"
+        event_upper="$(printf '%s' "$event" | tr '[:lower:]' '[:upper:]')"
+        case "$event_upper" in
+            LOST|DOWN|OFFLINE|UNREACHABLE) event_upper="LOST" ;;
+            BACK|UP|ONLINE|RECOVERED) event_upper="BACK" ;;
+            *) event_upper="EVENT" ;;
+        esac
+        record_timeline_event "$epoch" "$normalized" external-probe "$event_upper" "$line"
+    done <"$file"
+}
+
+record_monitor_timeline() {
+    local file="$1" line timestamp level details remainder epoch normalized
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == \[*\]\ \[*\]\ * ]] || continue
+        timestamp="${line#\[}"
+        timestamp="${timestamp%%\] *}"
+        remainder="${line#*\] \[}"
+        level="${remainder%%\]*}"
+        details="${remainder#*\] }"
+        case "$level" in
+            EVENT|ANOMALY|NETWORK-ANOMALY|NETWORK-RECOVERY|START|STOP) ;;
+            *) continue ;;
+        esac
+        epoch="$(date -d "$timestamp" +%s 2>/dev/null || true)"
+        [[ "$epoch" =~ ^[0-9]+$ ]] || continue
+        normalized="$(date -d "@$epoch" '+%F %T %z' 2>/dev/null || printf '%s' "$timestamp")"
+        record_timeline_event "$epoch" "$normalized" background-monitor "$level" "$details"
+    done <"$file"
+}
+
 import_probe_log() {
     [[ -n "$PROBE_LOG" ]] || return 0
     section "$(tr_text '外部探针证据' 'External probe evidence')"
 
     cp -- "$PROBE_LOG" "$BUNDLE_DIR/raw/external-probe.log"
+    record_probe_timeline "$PROBE_LOG"
     PROBE_LOST_COUNT="$(grep -Eic 'lost|down|offline|unreachable|不可达|中断|掉线' "$PROBE_LOG" 2>/dev/null || true)"
     if ((PROBE_LOST_COUNT > 0)); then
         status_line WARN "$(tr_text '外部探针记录到不可达事件' 'External probe recorded unreachable events'): $PROBE_LOST_COUNT"
@@ -1442,6 +1507,7 @@ import_process_monitor_log() {
     section "$(tr_text '后台资源与网络监控证据' 'Background resource and network-monitor evidence')"
 
     cp -- "$MONITOR_LOG" "$BUNDLE_DIR/raw/process-monitor.log"
+    record_monitor_timeline "$MONITOR_LOG"
     MONITOR_ANOMALY_COUNT="$(grep -Ec '\[(ANOMALY|NETWORK-ANOMALY)\]' "$MONITOR_LOG" 2>/dev/null || true)"
     MONITOR_NETWORK_DOWN_COUNT="$(grep -c 'scope=network state=DOWN' "$MONITOR_LOG" 2>/dev/null || true)"
     if ((MONITOR_ANOMALY_COUNT > 0)); then
@@ -1850,10 +1916,85 @@ write_review_prompt() {
 4. 短时异常进程、cgroup 限额、PSI 压力或 TCP 栈拥堵；
 5. 当前证据不足。
 
-请先阅读 summary.md 和 report.txt，再核对 raw/ 下的原始证据；如果存在 process-monitor.log，请把异常快照与外部探针时间线对齐。请按“已确认事实、合理推断、仍缺证据”三层输出，不要仅凭单次 CPU steal、单个 MTR 中间跳丢包或一次 Ping 失败就断定厂商责任。最后列出需要补采的命令、应提交厂商的问题，以及是否建议迁移节点。
+请先阅读 summary.md、timeline.md 和 report.txt，再核对 raw/ 下的原始证据；summary.json 可用于机器读取。如果存在 process-monitor.log，请核对统一时间线中的异常快照与外部探针事件。请按“已确认事实、合理推断、仍缺证据”三层输出，不要仅凭单次 CPU steal、单个 MTR 中间跳丢包或一次 Ping 失败就断定厂商责任。最后列出需要补采的命令、应提交厂商的问题，以及是否建议迁移节点。
 
 注意：不要要求用户提供密码、私钥、API Key 或其他秘密。
 EOF
+}
+
+write_timeline() {
+    local sorted_file="$TMP_DIR/timeline.sorted.tsv" epoch timestamp source event details safe_details
+    if ((${#TIMELINE_EVENTS[@]} > 0)); then
+        printf '%s\n' "${TIMELINE_EVENTS[@]}" | sort -n -k1,1 >"$sorted_file"
+    else
+        : >"$sorted_file"
+    fi
+
+    {
+        printf 'epoch\ttimestamp\tsource\tevent\tdetails\n'
+        cat "$sorted_file"
+    } >"$BUNDLE_DIR/timeline.tsv"
+
+    {
+        printf '# Unified event timeline\n\n'
+        printf -- '- External lost events: %d\n' "$PROBE_LOST_COUNT"
+        printf -- '- Background network DOWN transitions: %d\n' "$MONITOR_NETWORK_DOWN_COUNT"
+        printf -- '- Background anomaly snapshots: %d\n' "$MONITOR_ANOMALY_COUNT"
+        printf -- '- Foreground watch failures/transitions: %d/%d\n\n' "$WATCH_FAILURES" "$WATCH_TRANSITIONS"
+        printf '| Timestamp | Source | Event | Details |\n'
+        printf '| --- | --- | --- | --- |\n'
+        while IFS=$'\t' read -r epoch timestamp source event details; do
+            [[ -n "$epoch" ]] || continue
+            safe_details="${details//|//}"
+            printf '| %s | %s | %s | %s |\n' "$timestamp" "$source" "$event" "$safe_details"
+        done <"$sorted_file"
+        printf '\n> Timestamps are normalized to the VPS local timezone. Correlation is evidence alignment, not automatic proof of provider fault.\n'
+    } >"$BUNDLE_DIR/timeline.md"
+}
+
+json_quote() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\t'/\\t}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\n'/\\n}"
+    printf '"%s"' "$value"
+}
+
+write_summary_json() {
+    local overall="PASS" generated i comma
+    ((FAIL_COUNT > 0)) && overall="FAIL"
+    ((FAIL_COUNT == 0 && WARN_COUNT > 0)) && overall="WARN"
+    generated="$(date --iso-8601=seconds 2>/dev/null || date)"
+    {
+        printf '{\n'
+        printf '  "schema_version": "1.0",\n'
+        printf '  "tool": "vps-health-check",\n'
+        printf '  "version": %s,\n' "$(json_quote "$VERSION")"
+        printf '  "generated_at": %s,\n' "$(json_quote "$generated")"
+        printf '  "overall": %s,\n' "$(json_quote "$overall")"
+        printf '  "counts": {"pass": %d, "warn": %d, "fail": %d, "info": %d},\n' "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT" "$INFO_COUNT"
+        printf '  "connectivity": {"ping_tests": %d, "ping_warnings": %d, "ping_failures": %d, "dns_ok": %d, "https_ok": %d, "ipv6_ok": %d},\n' "$PING_TESTS" "$PING_WARNINGS" "$PING_FAILURES" "$DNS_OK" "$HTTPS_OK" "$IPV6_OK"
+        printf '  "monitoring": {"probe_lost_events": %d, "background_anomalies": %d, "background_network_down": %d, "watch_failures": %d, "watch_transitions": %d},\n' "$PROBE_LOST_COUNT" "$MONITOR_ANOMALY_COUNT" "$MONITOR_NETWORK_DOWN_COUNT" "$WATCH_FAILURES" "$WATCH_TRANSITIONS"
+        printf '  "signals": {"cpu_steal_pct": %d, "cpu_iowait_pct": %d, "tcp_retrans_pct": %d, "http_endpoint": %d, "dns_target": %d, "tls_expiry": %d, "nic_event": %d, "oom": %d, "storage_error": %d},\n' "$CPU_STEAL_PCT" "$CPU_IOWAIT_PCT" "$TCP_RETRANS_PCT" "$FLAG_HTTP_ENDPOINT" "$FLAG_DNS_TARGET" "$FLAG_TLS_EXPIRY" "$FLAG_NIC_EVENT" "$FLAG_OOM" "$FLAG_STORAGE_ERROR"
+        printf '  "timeline_events": %d,\n' "${#TIMELINE_EVENTS[@]}"
+        printf '  "recommendations_zh": ['
+        comma=""
+        for ((i = 0; i < ${#RECOMMENDATIONS_ZH[@]}; i++)); do
+            printf '%s%s' "$comma" "$(json_quote "${RECOMMENDATIONS_ZH[$i]}")"
+            comma=", "
+        done
+        printf '],\n'
+        printf '  "recommendations_en": ['
+        comma=""
+        for ((i = 0; i < ${#RECOMMENDATIONS_EN[@]}; i++)); do
+            printf '%s%s' "$comma" "$(json_quote "${RECOMMENDATIONS_EN[$i]}")"
+            comma=", "
+        done
+        printf ']\n'
+        printf '}\n'
+    } >"$BUNDLE_DIR/summary.json"
 }
 
 finalize_evidence_bundle() {
@@ -1861,6 +2002,8 @@ finalize_evidence_bundle() {
     write_summary_markdown
     write_support_ticket
     write_review_prompt
+    write_timeline
+    write_summary_json
     plain_log "[INFO] Evidence directory: $BUNDLE_DIR"
     cp -- "$OUTPUT_FILE" "$BUNDLE_DIR/report.txt"
 
@@ -1898,7 +2041,7 @@ watch_network() {
         return 1
     fi
 
-    local target="${TARGETS[0]}" start now elapsed=0 state="unknown" new_state
+    local target="${TARGETS[0]}" start now elapsed=0 state="unknown" new_state event_timestamp
     local checks=0 failures=0 transitions=0
     start="$(date +%s)"
     status_line INFO "$(tr_text '探测目标' 'Probe target'): $target; $(tr_text '间隔' 'interval')=${INTERVAL}s; $(tr_text '持续时间' 'duration')=$([[ "$WATCH_DURATION" == "0" ]] && printf 'until Ctrl+C' || printf '%ss' "$WATCH_DURATION")"
@@ -1925,8 +2068,10 @@ watch_network() {
             if [[ "$state" != "unknown" ]]; then
                 ((transitions += 1))
             fi
-            printf '[EVENT] %s %s %s\n' "$(date '+%F %T %z')" "$target" "$new_state"
-            plain_log "[EVENT] $(date '+%F %T %z') $target $new_state"
+            event_timestamp="$(date '+%F %T %z')"
+            printf '[EVENT] %s %s %s\n' "$event_timestamp" "$target" "$new_state"
+            plain_log "[EVENT] $event_timestamp $target $new_state"
+            record_timeline_event "$(date +%s)" "$event_timestamp" foreground-watch "$new_state" "target=$target"
             state="$new_state"
         fi
         sleep "$INTERVAL"
@@ -1948,6 +2093,7 @@ plain_log "Started: $(date --iso-8601=seconds 2>/dev/null || date)"
 plain_log "Command: $0"
 
 kernel_log="$(collect_kernel_log)"
+record_boot_timeline
 check_system
 check_resources
 check_pressure_and_limits

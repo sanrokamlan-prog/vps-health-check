@@ -269,6 +269,9 @@ sudo bash /tmp/vps-health-check.sh --lang en
 ```text
 vps-health-*-evidence/
 ├── summary.md               # 中英文结论与建议
+├── summary.json             # 供 Agent / 面板读取的稳定机器格式
+├── timeline.md              # VPS 本地时区的可读统一时间线
+├── timeline.tsv             # 可排序、可导入表格的事件数据
 ├── report.txt               # 完整检查报告
 ├── provider-ticket-en.txt   # 可直接修改并提交的英文工单
 ├── review-prompt.txt        # 管理员 / AI 结构化审查提示词
@@ -283,6 +286,8 @@ vps-health-*-evidence/
     ├── process-monitor.log  # 可选：后台异常进程监控日志
     └── mtr-*.txt            # 可选：MTR 原始结果
 ```
+
+统一时间线会归一化当前启动、外部探针、后台监控和前台 `--watch` 事件。它用于把相同时间附近的证据放在一起复核，不会仅凭时间接近自动判定厂商责任。`summary.json` 带有 `schema_version`，适合 Agent、脚本或面板稳定读取。
 
 证据包默认还会压缩为：
 

@@ -77,6 +77,9 @@ fi
 
 bundle="${report%.*}-evidence"
 [[ -s "$bundle/summary.md" ]]
+[[ -s "$bundle/summary.json" ]]
+[[ -s "$bundle/timeline.md" ]]
+[[ -s "$bundle/timeline.tsv" ]]
 [[ -s "$bundle/report.txt" ]]
 [[ -s "$bundle/provider-ticket-en.txt" ]]
 [[ -s "$bundle/review-prompt.txt" ]]
@@ -87,6 +90,15 @@ if command -v getent >/dev/null 2>&1; then
     grep -q 'DNS domain=localhost status=ok' "$bundle/raw/endpoints.txt"
 fi
 grep -q 'HTTP url=http://127.0.0.1:1/health code=000 status=connection-failed' "$bundle/raw/endpoints.txt"
+grep -q $'external-probe\tLOST\t' "$bundle/timeline.tsv"
+grep -q $'external-probe\tBACK\t' "$bundle/timeline.tsv"
+grep -q '"schema_version": "1.0"' "$bundle/summary.json"
+grep -q '"probe_lost_events": 2' "$bundle/summary.json"
+if python3 --version >/dev/null 2>&1; then
+    python3 -m json.tool "$bundle/summary.json" >/dev/null
+elif python --version >/dev/null 2>&1; then
+    python -m json.tool "$bundle/summary.json" >/dev/null
+fi
 if grep -R -q 'must-not-leak' "$bundle"; then
     printf 'URL query secret leaked into evidence bundle\n' >&2
     exit 1
@@ -140,6 +152,7 @@ set -e
 [[ ! -s "$TEST_DIR/monitor-import.err" ]]
 monitor_bundle="${monitor_report%.*}-evidence"
 [[ -s "$monitor_bundle/raw/process-monitor.log" ]]
+grep -q $'background-monitor\tANOMALY\t' "$monitor_bundle/timeline.tsv"
 grep -q 'background monitor captured' "$monitor_bundle/provider-ticket-en.txt"
 
 watch_report="$TEST_DIR/watch.log"
@@ -151,5 +164,6 @@ set -e
 [[ ! -s "$TEST_DIR/watch-stderr.txt" ]]
 grep -q '\[EVENT\]' "$watch_report"
 grep -q '持续监测汇总' "$watch_report"
+grep -q $'foreground-watch\t' "${watch_report%.*}-evidence/timeline.tsv"
 
 printf 'smoke tests passed\n'

@@ -73,6 +73,8 @@ sudo bash vps-health-check.sh \
 
 后台监控同时记录网络目标和整网状态。单个目标 `DOWN` 可能只是该目标限速 ICMP 或特定路由异常；只有所有配置目标都连续失败后才生成 `scope=network state=DOWN` 和 `NETWORK-ANOMALY` 快照。排查时优先对齐这种整网事件、恢复快照和外部探针时间，而不是把单目标失败直接当成 VPS 掉线。
 
+证据包中的 `timeline.md` 已将外部 `lost/back`、后台 `DOWN/UP`、异常快照、当前启动和前台 watch 事件转换到 VPS 本地时区并排序。时间接近只能说明事件值得共同复核；是否同一根因仍需核对 `report.txt`、`raw/` 和厂商宿主机日志。
+
 ## 如何看 MTR
 
 - 只看最后一跳和之后是否延续丢包，不要因单个中间路由器不回 ICMP 就判断线路故障。
