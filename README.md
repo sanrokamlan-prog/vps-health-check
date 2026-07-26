@@ -41,7 +41,7 @@ MTR / 持续监测 ───┘                         └─> 管理员 / AI �
 
 | 项目 | 当前能力 |
 | --- | --- |
-| 当前版本 | `v1.1.0` |
+| 当前版本 | `v1.2.0` |
 | 运行方式 | 单文件 Bash 脚本，下载即用 |
 | 默认语言 | 中文，支持 `--lang en` |
 | 操作边界 | 只读，不改防火墙、不重启服务、不安装软件 |
@@ -56,7 +56,7 @@ MTR / 持续监测 ───┘                         └─> 管理员 / AI �
 下载稳定版并立即检查：
 
 ```bash
-curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.1.0/vps-health-check.sh -o /tmp/vps-health-check.sh && sudo bash /tmp/vps-health-check.sh
+curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.2.0/vps-health-check.sh -o /tmp/vps-health-check.sh && sudo bash /tmp/vps-health-check.sh
 ```
 
 检查结束后，终端会给出报告与证据包路径：
@@ -87,7 +87,7 @@ curl -fsSL https://raw.githubusercontent.com/sanrokamlan-prog/vps-health-check/m
 下面是脚本发现宿主机争用线索与外部中断记录时的典型输出结构：
 
 ```text
-VPS Health Check v1.1.0
+VPS Health Check v1.2.0
 
 == 资源状态 ==
 [PASS] 内存使用率: 41%
@@ -130,13 +130,13 @@ PASS=18  WARN=2  FAIL=0
 
 | 检查域 | 检查内容 |
 | --- | --- |
-| 网卡 | 默认出口接口、operstate、累计与检查期间 RX/TX error/drop、link-down、watchdog |
+| 网卡 | 默认出口接口、operstate、RX/TX error/drop 基线与检查期间增量、link-down、watchdog |
 | 路由 | 默认路由、完整路由表、出口接口定位 |
-| 连通性 | 多目标 Ping、丢包率、平均延迟、DNS、HTTPS |
-| 连接状态 | Socket 摘要、conntrack、TCP 重传率、SYN-RECV、监听/积压队列丢弃、softnet |
+| 连通性 | 多目标 Ping、丢包率、平均延迟、DNS、IPv4/IPv6 HTTPS；仅在 IPv6 配置完整时测试 |
+| 连接状态 | Socket 摘要、conntrack、TCP 重传、SYN-RECV、监听/积压队列与 softnet 检查期间增量 |
 | 链路质量 | 可选 MTR 原始报告 |
 | 间歇故障 | `--watch` 持续记录带时区的 `UP/DOWN` 事件 |
-| 端口验证 | `--port` 本机监听检查、`--tcp` 远端 TCP 端口探测 |
+| 端口验证 | `--port` 本机 TCP、`--udp-port` 本机 UDP、`--tcp` 远端 TCP 探测 |
 
 ### 面向小白的判断输出
 
@@ -190,7 +190,7 @@ sudo bash /tmp/vps-health-check.sh --watch 3600 --interval 5
 一次性检查没有异常、但 VPS 持有者仍感觉卡顿、断流或偶发失联时，使用后台监控比人工蹲守更可靠：
 
 ```bash
-curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.1.0/vps-health-monitor.sh -o /tmp/vps-health-monitor.sh
+curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.2.0/vps-health-monitor.sh -o /tmp/vps-health-monitor.sh
 
 sudo bash /tmp/vps-health-monitor.sh start \
   --interval 3 \
@@ -320,6 +320,10 @@ vps-health-*-evidence/
 
 部分路由器会限制或忽略 ICMP 响应。只有中间某一跳丢包、后续与终点正常时，不能据此判断线路故障。应重点看终点是否丢包，以及业务中断时间是否一致。
 
+### 关于累计计数与误报
+
+网卡 error/drop、TCP 重传、监听队列丢弃和 softnet 计数都是从系统启动以来累计的，非零不代表现在仍有故障。脚本会保留累计值作为背景证据，但只有在本次检查期间继续增长才产生健康告警。系统近期启动同样只作为时间线信息；只有与外部 `lost/back` 或持续监测失败相互印证时，才给出重启方向建议。
+
 更完整的判断原则见 [VPS 异常排查说明](docs/diagnosis-guide.md)。
 
 ---
@@ -333,6 +337,7 @@ vps-health-*-evidence/
 --probe-log FILE   导入外部探针 lost/back 记录
 --monitor-log FILE 导入 vps-health-monitor.sh 的后台异常日志
 --port N           检查本机 TCP 端口是否监听，可重复使用
+--udp-port N       检查本机 UDP 端口是否绑定，可重复使用
 --tcp HOST:PORT    探测远端 TCP 端口，可重复使用（IPv4/主机名）
 --mtr              系统已安装 mtr 时生成路由报告
 --watch [SECONDS]  持续探测；不填秒数则运行到 Ctrl+C
@@ -380,6 +385,8 @@ vps-health-*-evidence/
 - 不读取环境变量、业务文件、密码、密钥或 Token；
 - 不收集完整进程参数，避免命令行中的秘密进入报告；
 - 不上传遥测、报告或证据包。
+
+报告、证据目录和后台监控日志默认使用当前用户私有权限；脚本拒绝向符号链接形式的报告、压缩包、日志或 PID 路径写入，降低以 root 运行时覆盖其他文件的风险。
 
 证据包仍可能包含主机名、公网 IP、接口名、服务名和进程名。公开分享前请自行检查 `raw/` 目录。
 

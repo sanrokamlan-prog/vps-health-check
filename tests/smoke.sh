@@ -12,6 +12,7 @@ bash -n "$ROOT_DIR/vps-health-monitor.sh"
 help_output="$(bash "$SCRIPT" --help)"
 [[ "$help_output" == *"--probe-log FILE"* ]]
 [[ "$help_output" == *"--monitor-log FILE"* ]]
+[[ "$help_output" == *"--udp-port N"* ]]
 monitor_help="$(bash "$ROOT_DIR/vps-health-monitor.sh" --help)"
 [[ "$monitor_help" == *"start             后台启动监控"* ]]
 
@@ -27,9 +28,27 @@ invalid_port_rc=$?
 set -e
 [[ "$invalid_port_rc" -eq 2 ]]
 
+set +e
+bash "$SCRIPT" --udp-port 70000 >/dev/null 2>&1
+invalid_udp_port_rc=$?
+set -e
+[[ "$invalid_udp_port_rc" -eq 2 ]]
+
+if [[ "$(uname -s)" == Linux* ]]; then
+    symlink_target="$TEST_DIR/symlink-target.log"
+    symlink_report="$TEST_DIR/symlink-report.log"
+    : >"$symlink_target"
+    ln -s "$symlink_target" "$symlink_report"
+    set +e
+    bash "$SCRIPT" --output "$symlink_report" >/dev/null 2>&1
+    symlink_rc=$?
+    set -e
+    [[ "$symlink_rc" -eq 2 ]]
+fi
+
 report="$TEST_DIR/smoke.log"
 set +e
-bash "$SCRIPT" --target 127.0.0.1 --port 22 --tcp example.com:443 --hours 1 --probe-log "$ROOT_DIR/examples/probe.log" --output "$report" --no-color >"$TEST_DIR/stdout.txt" 2>"$TEST_DIR/stderr.txt"
+bash "$SCRIPT" --target 127.0.0.1 --port 22 --udp-port 53 --tcp example.com:443 --hours 1 --probe-log "$ROOT_DIR/examples/probe.log" --output "$report" --no-color >"$TEST_DIR/stdout.txt" 2>"$TEST_DIR/stderr.txt"
 run_rc=$?
 set -e
 [[ "$run_rc" -ge 0 && "$run_rc" -le 2 ]]
@@ -62,6 +81,18 @@ grep -q '\[START\]' "$monitor_log"
 grep -q '\[ANOMALY\]' "$monitor_log"
 grep -q 'SNAPSHOT BEGIN' "$monitor_log"
 grep -q '\[STOP\]' "$monitor_log"
+
+renamed_monitor="$monitor_dir/renamed-monitor.sh"
+renamed_log="$monitor_dir/renamed.log"
+renamed_pid="$monitor_dir/renamed.pid"
+cp "$ROOT_DIR/vps-health-monitor.sh" "$renamed_monitor"
+bash "$renamed_monitor" start --duration 30 --interval 1 --load 0 --cooldown 60 --log "$renamed_log" --pid-file "$renamed_pid" >"$monitor_dir/start.txt"
+grep -q 'started: PID' "$monitor_dir/start.txt"
+bash "$renamed_monitor" status --log "$renamed_log" --pid-file "$renamed_pid" >"$monitor_dir/status.txt"
+grep -q 'running: PID' "$monitor_dir/status.txt"
+bash "$renamed_monitor" stop --log "$renamed_log" --pid-file "$renamed_pid" >"$monitor_dir/stop.txt"
+grep -q 'stopped' "$monitor_dir/stop.txt"
+[[ ! -e "$renamed_pid" ]]
 
 monitor_report="$TEST_DIR/monitor-import.log"
 set +e

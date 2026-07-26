@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 COMMAND="${1:-help}"
 [[ $# -gt 0 ]] && shift
 if [[ "$COMMAND" == "-h" || "$COMMAND" == "--help" ]]; then
@@ -30,6 +30,7 @@ else
 fi
 LOG_FILE="$STATE_DIR/monitor.log"
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+SCRIPT_BASENAME="$(basename -- "$SCRIPT_PATH")"
 
 declare -A LAST_ALERT=()
 
@@ -144,6 +145,10 @@ if [[ "$COMMAND" != "help" ]]; then
         exit 2
     }
     umask 077
+    if [[ -L "$LOG_FILE" || -L "$PID_FILE" ]]; then
+        echo "Refusing symbolic-link log or PID path" >&2
+        exit 2
+    fi
 fi
 
 command_exists() {
@@ -156,7 +161,7 @@ pid_is_monitor() {
     kill -0 "$pid" 2>/dev/null || return 1
     if [[ -r "/proc/$pid/cmdline" ]]; then
         cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-        [[ "$cmdline" == *"vps-health-monitor.sh"* ]]
+        [[ "$cmdline" == *"$SCRIPT_BASENAME"* ]]
     else
         return 0
     fi
@@ -369,13 +374,13 @@ case "$COMMAND" in
             --max-log-mb "$MAX_LOG_MB" \
             --log "$LOG_FILE" \
             --pid-file "$PID_FILE" \
-            >/dev/null 2>&1 &
+            >>"$LOG_FILE" 2>&1 &
         child_pid=$!
         sleep 1
         if pid_is_monitor "$child_pid"; then
             echo "VPS Health Monitor started: PID $child_pid"
             echo "Log: $LOG_FILE"
-            echo "Stop: sudo bash $SCRIPT_PATH stop --log $LOG_FILE --pid-file $PID_FILE"
+            printf 'Stop: sudo bash %q stop --log %q --pid-file %q\n' "$SCRIPT_PATH" "$LOG_FILE" "$PID_FILE"
         else
             echo "Monitor failed to start; check: $LOG_FILE" >&2
             exit 1

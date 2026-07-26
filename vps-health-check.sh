@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 PROJECT_URL="https://github.com/sanrokamlan-prog/vps-health-check"
 HOURS=24
 INTERVAL=5
@@ -21,6 +21,7 @@ TARGETS=("1.1.1.1" "8.8.8.8")
 TARGETS_OVERRIDDEN=0
 SERVICES=()
 PORTS=()
+UDP_PORTS=()
 TCP_TARGETS=()
 
 PASS_COUNT=0
@@ -80,11 +81,19 @@ NET_TX_ERROR_DELTA=0
 NET_RX_DROP_DELTA=0
 NET_TX_DROP_DELTA=0
 TCP_RETRANS_PCT=0
+TCP_OUT_START=0
+TCP_RETRANS_START=0
+LISTEN_OVERFLOW_START=0
+LISTEN_DROP_START=0
+BACKLOG_DROP_START=0
+SOFTNET_DROP_START=0
+SOFTNET_SQUEEZE_START=0
 PING_TESTS=0
 PING_FAILURES=0
 PING_WARNINGS=0
 DNS_OK=-1
 HTTPS_OK=-1
+IPV6_OK=-1
 PROBE_LOST_COUNT=0
 MONITOR_ANOMALY_COUNT=0
 FLAG_PROCESS_MONITOR=0
@@ -107,6 +116,7 @@ VPS 健康与网络诊断脚本
   --target HOST      网络探测目标，可重复使用（默认：1.1.1.1、8.8.8.8）
   --service NAME     检查指定 systemd 服务，可重复使用
   --port N           检查本机 TCP 端口是否监听，可重复使用
+  --udp-port N       检查本机 UDP 端口是否监听，可重复使用
   --tcp HOST:PORT    探测远端 TCP 端口，可重复使用（IPv4/主机名）
   --probe-log FILE   导入外部探针的 lost/back 记录并放入证据包
   --monitor-log FILE 导入 vps-health-monitor.sh 的后台异常日志
@@ -121,7 +131,7 @@ VPS 健康与网络诊断脚本
 示例：
   sudo bash vps-health-check.sh
   sudo bash vps-health-check.sh --service xray --service nginx --mtr
-  sudo bash vps-health-check.sh --port 22 --port 443 --tcp example.com:443
+  sudo bash vps-health-check.sh --port 22 --port 443 --udp-port 53 --tcp example.com:443
   sudo bash vps-health-check.sh --probe-log probe.log --mtr
   sudo bash vps-health-check.sh --monitor-log /var/log/vps-health-monitor/monitor.log
   sudo bash vps-health-check.sh --watch 3600 --interval 5
@@ -156,6 +166,11 @@ while (($# > 0)); do
         --port)
             [[ $# -ge 2 ]] || { echo "--port requires a value" >&2; exit 2; }
             PORTS+=("$2")
+            shift 2
+            ;;
+        --udp-port)
+            [[ $# -ge 2 ]] || { echo "--udp-port requires a value" >&2; exit 2; }
+            UDP_PORTS+=("$2")
             shift 2
             ;;
         --tcp)
@@ -235,6 +250,12 @@ for port in "${PORTS[@]}"; do
         exit 2
     fi
 done
+for port in "${UDP_PORTS[@]}"; do
+    if ! is_uint "$port" || ((port < 1 || port > 65535)); then
+        echo "--udp-port must be between 1 and 65535: $port" >&2
+        exit 2
+    fi
+done
 for tcp_target in "${TCP_TARGETS[@]}"; do
     tcp_host="${tcp_target%:*}"
     tcp_port="${tcp_target##*:}"
@@ -287,8 +308,13 @@ if [[ ! -d "$output_dir" ]] || [[ ! -w "$output_dir" ]]; then
     echo "Cannot write report directory: $output_dir" >&2
     exit 2
 fi
+umask 077
+if [[ -L "$OUTPUT_FILE" || -L "$BUNDLE_DIR" || -L "$BUNDLE_ARCHIVE" ]]; then
+    echo "Refusing symbolic-link report or evidence path" >&2
+    exit 2
+fi
 : >"$OUTPUT_FILE" || { echo "Cannot write report: $OUTPUT_FILE" >&2; exit 2; }
-if [[ -e "$BUNDLE_DIR" ]]; then
+if [[ -e "$BUNDLE_DIR" || -L "$BUNDLE_DIR" ]]; then
     echo "Evidence directory already exists: $BUNDLE_DIR" >&2
     exit 2
 fi
@@ -481,9 +507,9 @@ check_system() {
     if ((uptime_seconds > 0 && uptime_seconds < HOURS * 3600)); then
         FLAG_RECENT_REBOOT=1
         if ((uptime_seconds < 600)); then
-            status_line WARN "$(tr_text '系统在 10 分钟内启动过' 'System booted within the last 10 minutes'): $uptime_human"
+            status_line INFO "$(tr_text '系统在 10 分钟内启动过，需结合是否主动重启判断' 'System booted within the last 10 minutes; correlate with whether this was intentional'): $uptime_human"
         else
-            status_line WARN "$(tr_text "系统在最近 ${HOURS} 小时内启动过" "System booted within the last ${HOURS} hours"): $uptime_human"
+            status_line INFO "$(tr_text "系统在最近 ${HOURS} 小时内启动过，作为时间线证据记录" "System booted within the last ${HOURS} hours; recorded as timeline evidence"): $uptime_human"
         fi
     else
         status_line PASS "$(tr_text '运行时间' 'Uptime'): $uptime_human"
@@ -597,9 +623,7 @@ check_resources() {
     fi
 }
 
-check_pressure_and_limits() {
-    section "$(tr_text '压力、配额与进程健康' 'Pressure, quotas, and process health')"
-
+check_psi_pressure() {
     if [[ -r /proc/pressure/cpu ]]; then
         PSI_CPU_AVG10="$(psi_avg10 /proc/pressure/cpu some)"
         PSI_MEMORY_FULL_AVG10="$(psi_avg10 /proc/pressure/memory full)"
@@ -613,7 +637,9 @@ check_pressure_and_limits() {
     else
         status_line INFO "$(tr_text '内核未提供 PSI 压力指标' 'Kernel pressure stall information (PSI) is unavailable')"
     fi
+}
 
+check_cgroup_limits() {
     if [[ -r /sys/fs/cgroup/cpu.max ]]; then
         local quota period
         read -r quota period < /sys/fs/cgroup/cpu.max
@@ -664,7 +690,9 @@ check_pressure_and_limits() {
             fi
         fi
     fi
+}
 
+check_process_states() {
     if command_exists ps; then
         local d_count z_count
         d_count="$(ps -eo stat= 2>/dev/null | awk '$1 ~ /^D/ {count++} END {print count + 0}')"
@@ -688,7 +716,9 @@ check_pressure_and_limits() {
             status_line PASS "$(tr_text '没有僵尸进程' 'No zombie processes')"
         fi
     fi
+}
 
+check_file_handles_and_rootfs() {
     if [[ -r /proc/sys/fs/file-nr ]]; then
         local file_allocated _file_unused file_max file_pct
         read -r file_allocated _file_unused file_max < /proc/sys/fs/file-nr
@@ -716,6 +746,14 @@ check_pressure_and_limits() {
             status_line PASS "$(tr_text '根文件系统可写' 'Root filesystem is writable')"
         fi
     fi
+}
+
+check_pressure_and_limits() {
+    section "$(tr_text '压力、配额与进程健康' 'Pressure, quotas, and process health')"
+    check_psi_pressure
+    check_cgroup_limits
+    check_process_states
+    check_file_handles_and_rootfs
 }
 
 check_services_and_reboots() {
@@ -857,14 +895,6 @@ check_network_interface() {
     NET_RX_DROPPED_START=$rx_dropped
     NET_TX_DROPPED_START=$tx_dropped
     status_line INFO "$(tr_text '网卡累计计数' 'Lifetime NIC counters'): RX errors=$rx_errors, TX errors=$tx_errors, RX dropped=$rx_dropped, TX dropped=$tx_dropped"
-    if ((rx_errors > 0 || tx_errors > 0)); then
-        FLAG_NIC_COUNTER=1
-        status_line WARN "$(tr_text '网卡存在累计错误包；需结合运行时间和增量判断' 'NIC error counters are non-zero; compare their growth over time')"
-    fi
-    if ((rx_dropped > 1000 || tx_dropped > 1000)); then
-        FLAG_NIC_COUNTER=1
-        status_line WARN "$(tr_text '网卡累计丢包较多；需再次运行脚本比较是否持续增长' 'NIC drop counters are high; rerun later to check whether they keep increasing')"
-    fi
 
     if [[ -r /proc/sys/net/netfilter/nf_conntrack_count && -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
         local conn_count conn_max conn_pct
@@ -916,6 +946,45 @@ ping_target() {
     fi
 }
 
+check_ipv6_connectivity() {
+    local global_address default_route ping_ok=0 curl_ok=-1 http_code
+    command_exists ip || {
+        status_line INFO "$(tr_text '缺少 ip 命令，跳过 IPv6 检查' 'ip is unavailable; skipped IPv6 checks')"
+        return
+    }
+
+    global_address="$(ip -6 -o addr show scope global 2>/dev/null | awk 'NR == 1 {print $4}')"
+    default_route="$(ip -6 route show default 2>/dev/null | head -n 1)"
+    if [[ -z "$global_address" || -z "$default_route" ]]; then
+        status_line INFO "$(tr_text '未检测到完整的全局 IPv6 地址和默认路由，跳过 IPv6 出站检查' 'No complete global IPv6 address and default route were detected; skipped IPv6 egress checks')"
+        return
+    fi
+
+    if command_exists ping && ping -6 -n -c 3 -W 2 2606:4700:4700::1111 >/dev/null 2>&1; then
+        ping_ok=1
+    fi
+    if command_exists curl; then
+        curl_ok=0
+        http_code="$(curl -6 -sSIL --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' https://example.com 2>/dev/null || true)"
+        [[ "$http_code" =~ ^[23][0-9][0-9]$ ]] && curl_ok=1
+    fi
+
+    if ((curl_ok == 1)); then
+        IPV6_OK=1
+        if ((ping_ok == 1)); then
+            status_line PASS "$(tr_text 'IPv6 ICMP 与 HTTPS 出站正常' 'IPv6 ICMP and HTTPS egress work') ($global_address)"
+        else
+            status_line PASS "$(tr_text 'IPv6 HTTPS 出站正常；ICMPv6 无响应或被过滤' 'IPv6 HTTPS egress works; ICMPv6 did not respond or is filtered') ($global_address)"
+        fi
+    elif ((curl_ok == -1 && ping_ok == 1)); then
+        IPV6_OK=1
+        status_line PASS "$(tr_text 'IPv6 ICMP 出站正常' 'IPv6 ICMP egress works') ($global_address)"
+    else
+        IPV6_OK=0
+        status_line FAIL "$(tr_text '已配置 IPv6 地址和默认路由，但 IPv6 出站检查失败' 'IPv6 address and default route exist, but IPv6 egress checks failed') ($global_address)"
+    fi
+}
+
 check_connectivity() {
     section "$(tr_text '外网连通性' 'Internet connectivity')"
 
@@ -954,6 +1023,8 @@ check_connectivity() {
         status_line INFO "$(tr_text '缺少 curl，跳过 HTTPS 检查' 'curl is unavailable; skipped HTTPS check')"
     fi
 
+    check_ipv6_connectivity
+
     if ((RUN_MTR == 1)); then
         if command_exists mtr; then
             local mtr_target mtr_output
@@ -980,9 +1051,35 @@ netstat_field() {
     ' "$file" 2>/dev/null
 }
 
-check_network_stack_and_ports() {
-    section "$(tr_text 'TCP 栈、增量丢包与端口' 'TCP stack, drop deltas, and ports')"
+softnet_totals() {
+    local _processed_hex dropped_hex squeezed_hex _rest dropped=0 squeezed=0
+    [[ -r /proc/net/softnet_stat ]] || { printf '0 0'; return 0; }
+    while read -r _processed_hex dropped_hex squeezed_hex _rest; do
+        [[ "$dropped_hex" =~ ^[0-9A-Fa-f]+$ ]] && dropped=$((dropped + 16#$dropped_hex))
+        [[ "$squeezed_hex" =~ ^[0-9A-Fa-f]+$ ]] && squeezed=$((squeezed + 16#$squeezed_hex))
+    done < /proc/net/softnet_stat
+    printf '%s %s' "$dropped" "$squeezed"
+}
 
+capture_network_stack_baseline() {
+    if [[ -r /proc/net/snmp ]]; then
+        TCP_OUT_START="$(netstat_field /proc/net/snmp 'Tcp:' OutSegs)"
+        TCP_RETRANS_START="$(netstat_field /proc/net/snmp 'Tcp:' RetransSegs)"
+        TCP_OUT_START="${TCP_OUT_START:-0}"
+        TCP_RETRANS_START="${TCP_RETRANS_START:-0}"
+    fi
+    if [[ -r /proc/net/netstat ]]; then
+        LISTEN_OVERFLOW_START="$(netstat_field /proc/net/netstat 'TcpExt:' ListenOverflows)"
+        LISTEN_DROP_START="$(netstat_field /proc/net/netstat 'TcpExt:' ListenDrops)"
+        BACKLOG_DROP_START="$(netstat_field /proc/net/netstat 'TcpExt:' TCPBacklogDrop)"
+        LISTEN_OVERFLOW_START="${LISTEN_OVERFLOW_START:-0}"
+        LISTEN_DROP_START="${LISTEN_DROP_START:-0}"
+        BACKLOG_DROP_START="${BACKLOG_DROP_START:-0}"
+    fi
+    read -r SOFTNET_DROP_START SOFTNET_SQUEEZE_START <<<"$(softnet_totals)"
+}
+
+check_interface_counter_deltas() {
     if [[ -n "$DEFAULT_IFACE" && -d "/sys/class/net/$DEFAULT_IFACE" ]]; then
         local rx_errors_end tx_errors_end rx_dropped_end tx_dropped_end
         rx_errors_end="$(read_counter "$DEFAULT_IFACE" rx_errors)"
@@ -1003,57 +1100,78 @@ check_network_stack_and_ports() {
             status_line PASS "$(tr_text '本次检查期间网卡错误/丢包计数未增长' 'NIC errors/drop counters did not increase during this check')"
         fi
     fi
+}
 
+check_tcp_counter_deltas() {
     if [[ -r /proc/net/snmp ]]; then
-        local out_segments retrans_segments
+        local out_segments retrans_segments out_delta retrans_delta
         out_segments="$(netstat_field /proc/net/snmp 'Tcp:' OutSegs)"
         retrans_segments="$(netstat_field /proc/net/snmp 'Tcp:' RetransSegs)"
         out_segments="${out_segments:-0}"
         retrans_segments="${retrans_segments:-0}"
-        if ((out_segments > 0)); then
-            TCP_RETRANS_PCT="$(awk -v retrans="$retrans_segments" -v sent="$out_segments" 'BEGIN {printf "%d", retrans * 100 / sent}')"
-            if ((out_segments >= 1000 && TCP_RETRANS_PCT >= 15)); then
+        out_delta=$((out_segments - TCP_OUT_START))
+        retrans_delta=$((retrans_segments - TCP_RETRANS_START))
+        status_line INFO "$(tr_text 'TCP 启动以来累计计数' 'Lifetime TCP counters'): out=$out_segments retrans=$retrans_segments"
+        if ((out_delta < 0 || retrans_delta < 0)); then
+            status_line INFO "$(tr_text 'TCP 计数器在检查期间重置' 'TCP counters reset during this check')"
+        elif ((out_delta > 0)); then
+            TCP_RETRANS_PCT="$(awk -v retrans="$retrans_delta" -v sent="$out_delta" 'BEGIN {printf "%d", retrans * 100 / sent}')"
+            if ((out_delta >= 20 && TCP_RETRANS_PCT >= 15)); then
                 FLAG_TCP_RETRANS=2
-                status_line FAIL "$(tr_text 'TCP 累计重传率很高' 'Lifetime TCP retransmission ratio is very high'): ${TCP_RETRANS_PCT}% ($retrans_segments/$out_segments)"
-            elif ((out_segments >= 1000 && TCP_RETRANS_PCT >= 5)); then
+                status_line FAIL "$(tr_text '检查期间 TCP 重传率很高' 'TCP retransmission ratio during this check is very high'): ${TCP_RETRANS_PCT}% ($retrans_delta/$out_delta)"
+            elif ((out_delta >= 20 && TCP_RETRANS_PCT >= 5)); then
                 FLAG_TCP_RETRANS=1
-                status_line WARN "$(tr_text 'TCP 累计重传率偏高' 'Lifetime TCP retransmission ratio is elevated'): ${TCP_RETRANS_PCT}% ($retrans_segments/$out_segments)"
+                status_line WARN "$(tr_text '检查期间 TCP 重传率偏高' 'TCP retransmission ratio during this check is elevated'): ${TCP_RETRANS_PCT}% ($retrans_delta/$out_delta)"
             else
-                status_line PASS "$(tr_text 'TCP 累计重传率' 'Lifetime TCP retransmission ratio'): ${TCP_RETRANS_PCT}% ($retrans_segments/$out_segments)"
+                status_line PASS "$(tr_text '检查期间 TCP 重传率' 'TCP retransmission ratio during this check'): ${TCP_RETRANS_PCT}% ($retrans_delta/$out_delta)"
             fi
+        else
+            status_line INFO "$(tr_text '检查期间没有新的 TCP 出站段，无法计算增量重传率' 'No new outbound TCP segments; delta retransmission ratio is unavailable')"
         fi
     fi
 
     if [[ -r /proc/net/netstat ]]; then
-        local listen_overflows listen_drops backlog_drops
+        local listen_overflows listen_drops backlog_drops overflow_delta listen_drop_delta backlog_drop_delta
         listen_overflows="$(netstat_field /proc/net/netstat 'TcpExt:' ListenOverflows)"
         listen_drops="$(netstat_field /proc/net/netstat 'TcpExt:' ListenDrops)"
         backlog_drops="$(netstat_field /proc/net/netstat 'TcpExt:' TCPBacklogDrop)"
         listen_overflows="${listen_overflows:-0}"
         listen_drops="${listen_drops:-0}"
         backlog_drops="${backlog_drops:-0}"
-        if ((listen_overflows > 0 || listen_drops > 0 || backlog_drops > 0)); then
+        overflow_delta=$((listen_overflows - LISTEN_OVERFLOW_START))
+        listen_drop_delta=$((listen_drops - LISTEN_DROP_START))
+        backlog_drop_delta=$((backlog_drops - BACKLOG_DROP_START))
+        status_line INFO "$(tr_text 'TCP 队列启动以来累计计数' 'Lifetime TCP queue counters'): overflow=$listen_overflows listen_drop=$listen_drops backlog_drop=$backlog_drops"
+        if ((overflow_delta < 0 || listen_drop_delta < 0 || backlog_drop_delta < 0)); then
+            status_line INFO "$(tr_text 'TCP 队列计数器在检查期间重置' 'TCP queue counters reset during this check')"
+        elif ((overflow_delta > 0 || listen_drop_delta > 0 || backlog_drop_delta > 0)); then
             FLAG_SYN_BACKLOG=1
-            status_line WARN "$(tr_text 'TCP 监听/积压队列存在累计丢弃' 'TCP listen/backlog queues have cumulative drops'): overflow=$listen_overflows listen_drop=$listen_drops backlog_drop=$backlog_drops"
+            status_line WARN "$(tr_text '检查期间 TCP 监听/积压队列发生新丢弃' 'New TCP listen/backlog queue drops occurred during this check'): overflow=+$overflow_delta listen_drop=+$listen_drop_delta backlog_drop=+$backlog_drop_delta"
         else
-            status_line PASS "$(tr_text '未发现 TCP 监听/积压队列丢弃' 'No TCP listen/backlog queue drops found')"
+            status_line PASS "$(tr_text '检查期间没有新增 TCP 监听/积压队列丢弃' 'No new TCP listen/backlog queue drops during this check')"
         fi
     fi
+}
 
+check_softnet_deltas() {
     if [[ -r /proc/net/softnet_stat ]]; then
-        local _processed_hex dropped_hex squeezed_hex _rest softnet_dropped=0 softnet_squeezed=0
-        while read -r _processed_hex dropped_hex squeezed_hex _rest; do
-            [[ "$dropped_hex" =~ ^[0-9A-Fa-f]+$ ]] && softnet_dropped=$((softnet_dropped + 16#$dropped_hex))
-            [[ "$squeezed_hex" =~ ^[0-9A-Fa-f]+$ ]] && softnet_squeezed=$((softnet_squeezed + 16#$squeezed_hex))
-        done < /proc/net/softnet_stat
-        if ((softnet_dropped > 0 || softnet_squeezed > 0)); then
+        local softnet_dropped softnet_squeezed softnet_drop_delta softnet_squeeze_delta
+        read -r softnet_dropped softnet_squeezed <<<"$(softnet_totals)"
+        softnet_drop_delta=$((softnet_dropped - SOFTNET_DROP_START))
+        softnet_squeeze_delta=$((softnet_squeezed - SOFTNET_SQUEEZE_START))
+        status_line INFO "$(tr_text 'softnet 启动以来累计计数' 'Lifetime softnet counters'): dropped=$softnet_dropped squeezed=$softnet_squeezed"
+        if ((softnet_drop_delta < 0 || softnet_squeeze_delta < 0)); then
+            status_line INFO "$(tr_text 'softnet 计数器在检查期间重置' 'Softnet counters reset during this check')"
+        elif ((softnet_drop_delta > 0 || softnet_squeeze_delta > 0)); then
             FLAG_NETWORK_STACK=1
-            status_line WARN "$(tr_text '内核 softnet 存在累计丢包/处理挤压' 'Kernel softnet has cumulative drops/time-squeeze events'): dropped=$softnet_dropped squeezed=$softnet_squeezed"
+            status_line WARN "$(tr_text '检查期间 softnet 发生新丢包/处理挤压' 'New softnet drops/time-squeeze events occurred during this check'): dropped=+$softnet_drop_delta squeezed=+$softnet_squeeze_delta"
         else
-            status_line PASS "$(tr_text '内核 softnet 没有累计丢包' 'No cumulative kernel softnet drops')"
+            status_line PASS "$(tr_text '检查期间 softnet 计数未增长' 'Softnet counters did not increase during this check')"
         fi
     fi
+}
 
+check_socket_states_and_local_ports() {
     if command_exists ss; then
         local state_summary syn_recv
         state_summary="$(ss -Hant 2>/dev/null | awk '{count[$1]++} END {for (state in count) printf "%s=%d ", state, count[state]}' || true)"
@@ -1079,10 +1197,22 @@ check_network_stack_and_ports() {
                 status_line FAIL "$(tr_text '本机 TCP 端口未监听' 'Local TCP port is not listening'): $port"
             fi
         done
-    elif ((${#PORTS[@]} > 0)); then
+
+        for port in "${UDP_PORTS[@]}"; do
+            listen_line="$(ss -H -lnu 2>/dev/null | awk -v suffix=":$port" '$4 ~ suffix "$" {print; exit}')"
+            if [[ -n "$listen_line" ]]; then
+                status_line PASS "$(tr_text '本机 UDP 端口已绑定' 'Local UDP port is bound'): $port"
+            else
+                FLAG_PORT_CHECK=1
+                status_line FAIL "$(tr_text '本机 UDP 端口未绑定' 'Local UDP port is not bound'): $port"
+            fi
+        done
+    elif ((${#PORTS[@]} > 0 || ${#UDP_PORTS[@]} > 0)); then
         status_line WARN "$(tr_text '缺少 ss，无法检查指定监听端口' 'ss is unavailable; requested listening-port checks were skipped')"
     fi
+}
 
+check_remote_tcp_targets() {
     if ((${#TCP_TARGETS[@]} > 0)); then
         if command_exists timeout; then
             local tcp_target host port
@@ -1100,6 +1230,15 @@ check_network_stack_and_ports() {
             status_line WARN "$(tr_text '缺少 timeout，无法安全执行远端 TCP 探测' 'timeout is unavailable; remote TCP probes were skipped safely')"
         fi
     fi
+}
+
+check_network_stack_and_ports() {
+    section "$(tr_text 'TCP/UDP 栈、增量丢包与端口' 'TCP/UDP stack, drop deltas, and ports')"
+    check_interface_counter_deltas
+    check_tcp_counter_deltas
+    check_softnet_deltas
+    check_socket_states_and_local_ports
+    check_remote_tcp_targets
 }
 
 import_probe_log() {
@@ -1135,9 +1274,7 @@ import_process_monitor_log() {
     append_block "$(tr_text '后台监控日志末尾（完整文件已进入证据包）：' 'Monitor log tail (full file is in the evidence bundle):')" "$(tail -n 80 "$MONITOR_LOG" 2>/dev/null || true)"
 }
 
-build_recommendations() {
-    section "$(tr_text '建议与下一步' 'Recommendations and next steps')"
-
+build_resource_recommendations() {
     if ((FLAG_HIGH_LOAD > 0)); then
         add_recommendation \
             "系统负载高于可用 CPU。先查看 evidence/raw/processes.txt 和 top，判断是本机进程占用还是 CPU steal 同时偏高；只有排除本机负载后，才应把方向转向宿主机争用。" \
@@ -1189,7 +1326,9 @@ build_recommendations() {
             "Kernel I/O or filesystem errors were found. Back up important data immediately, preserve the raw kernel log, and contact the provider instead of masking the issue with a reboot."
         add_ticket_fact "The guest kernel log contains storage or filesystem I/O errors."
     fi
+}
 
+build_system_recommendations() {
     if ((FLAG_KERNEL_CRASH > 0)); then
         add_recommendation \
             "内核日志记录到进程崩溃、general protection fault 或硬件错误。先定位对应程序与时间；若出现 MCE/hardware error 或多个无关进程同时崩溃，应把原始内核日志提交厂商。" \
@@ -1227,12 +1366,14 @@ build_recommendations() {
         add_ticket_fact "The guest root filesystem was observed mounted read-only."
     fi
 
-    if ((FLAG_RECENT_REBOOT > 0)); then
+    if ((FLAG_RECENT_REBOOT > 0 && (PROBE_LOST_COUNT > 0 || WATCH_FAILURES > 0 || WATCH_TRANSITIONS > 0))); then
         add_recommendation \
             "系统在检查窗口内重启过。将 last -x、上一启动日志和外部探针时间对齐；若没有客户机重启命令或内核原因，要求厂商核查宿主机重启/迁移记录。" \
             "The system rebooted within the review window. Correlate last -x, previous-boot logs, and external monitoring; if no guest-side cause exists, ask the provider for host reboot or migration records."
     fi
+}
 
+build_network_recommendations() {
     if ((FLAG_CONNTRACK > 0)); then
         add_recommendation \
             "连接跟踪表使用率偏高，检查 ss -s、连接洪泛、NAT/代理并发和防火墙规则；耗尽时会表现为新连接随机失败。" \
@@ -1247,8 +1388,8 @@ build_recommendations() {
 
     if ((FLAG_PORT_CHECK > 0)); then
         add_recommendation \
-            "指定的本机 TCP 端口没有监听。先检查对应服务状态、监听地址和启动日志，再检查防火墙；端口本身未监听时不应先归因于线路或厂商。" \
-            "A requested local TCP port is not listening. Check the service state, bind address, and startup logs before the firewall; a non-listening port is a guest-side issue before it is a provider/network issue."
+            "指定的本机 TCP/UDP 端口没有监听或绑定。先检查对应服务状态、监听地址和启动日志，再检查防火墙；端口本身未就绪时不应先归因于线路或厂商。" \
+            "A requested local TCP/UDP port is not listening or bound. Check the service state, bind address, and startup logs before the firewall; an unavailable local port is a guest-side issue before it is a provider/network issue."
     fi
 
     if ((FLAG_TCP_TARGET > 0)); then
@@ -1261,15 +1402,17 @@ build_recommendations() {
         add_recommendation \
             "发现网卡链路事件或错误计数。短时间重复运行并比较计数是否增长；若 virtio/ens 网卡出现 link down、watchdog 或发送超时，建议连同时间点提交厂商检查虚拟网卡和宿主机网络。" \
             "NIC link events or error counters were found. Rerun the check and compare counter growth; virtio/ens link-down, watchdog, or transmit-timeout events should be escalated to the provider with timestamps."
-        add_ticket_fact "The guest recorded NIC link events or non-zero NIC error/drop counters."
+        add_ticket_fact "The guest recorded NIC link events or NIC error/drop counters that increased during the check."
     fi
 
-    if ((PING_FAILURES > 0 || PING_WARNINGS > 0 || DNS_OK == 0 || HTTPS_OK == 0)); then
+    if ((PING_FAILURES > 0 || PING_WARNINGS > 0 || DNS_OK == 0 || HTTPS_OK == 0 || IPV6_OK == 0)); then
         add_recommendation \
             "当前存在丢包或外网连通异常。分别从本地、另一台稳定 VPS 和故障 VPS 做 MTR；只有中间跳丢包但终点正常不能作为故障证据，重点看终点丢包和 lost/back 时间。" \
             "Packet loss or outbound connectivity issues were detected. Run MTR from your local network, a stable VPS, and the affected VPS; intermediate-hop ICMP loss alone is not proof, so focus on destination loss and lost/back timestamps."
     fi
+}
 
+build_timeline_recommendations() {
     if ((PROBE_LOST_COUNT > 0)); then
         if ((FLAG_NIC_EVENT == 0 && FLAG_OOM == 0 && FLAG_KERNEL_LOCKUP == 0 && FLAG_SERVICE_DOWN == 0)); then
             add_recommendation \
@@ -1295,6 +1438,14 @@ build_recommendations() {
             "后台监控捕获到 ${MONITOR_ANOMALY_COUNT} 个异常快照。按时间查看 process-monitor.log 中的 Top CPU/内存、D 状态、steal、iowait 和 PSI，并与探针 lost/back 时间对齐后再定责。" \
             "The background monitor captured ${MONITOR_ANOMALY_COUNT} anomaly snapshots. Correlate Top CPU/memory, D-state, steal, iowait, and PSI in process-monitor.log with external lost/back timestamps before assigning cause."
     fi
+}
+
+build_recommendations() {
+    section "$(tr_text '建议与下一步' 'Recommendations and next steps')"
+    build_resource_recommendations
+    build_system_recommendations
+    build_network_recommendations
+    build_timeline_recommendations
 
     if ((${#RECOMMENDATIONS_ZH[@]} == 0)); then
         add_recommendation \
@@ -1318,7 +1469,7 @@ build_recommendations() {
     done
 }
 
-collect_raw_evidence() {
+collect_raw_system_resources() {
     cp -- "$TMP_DIR/kernel.log" "$BUNDLE_DIR/raw/kernel-${HOURS}h.txt" 2>/dev/null || true
 
     {
@@ -1372,7 +1523,9 @@ collect_raw_evidence() {
             findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null || true
         fi
     } >"$BUNDLE_DIR/raw/pressure-and-limits.txt"
+}
 
+collect_raw_network_services() {
     {
         if command_exists ip; then
             ip address show 2>/dev/null || true
@@ -1417,6 +1570,11 @@ collect_raw_evidence() {
     if command_exists journalctl; then
         journalctl -b -1 -p warning..alert --no-pager 2>/dev/null >"$BUNDLE_DIR/raw/previous-boot-warnings.txt" || true
     fi
+}
+
+collect_raw_evidence() {
+    collect_raw_system_resources
+    collect_raw_network_services
 }
 
 write_summary_markdown() {
@@ -1590,6 +1748,7 @@ check_pressure_and_limits
 check_services_and_reboots
 check_kernel_events "$kernel_log"
 check_network_interface
+capture_network_stack_baseline
 check_connectivity
 check_network_stack_and_ports
 import_probe_log

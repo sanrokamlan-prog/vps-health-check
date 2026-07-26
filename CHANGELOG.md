@@ -2,6 +2,16 @@
 
 All notable changes are documented in this file.
 
+## 1.2.0 - 2026-07-26
+
+- Changed lifetime NIC, TCP retransmission, listen/backlog, and softnet counters to informational context; health findings now use deltas captured during the current check.
+- Added conditional IPv6 egress checks and repeatable `--udp-port` local UDP binding checks.
+- Reduced reboot false positives by treating recent boot time as timeline evidence unless it correlates with an outage.
+- Split pressure, cgroup, process, filesystem, network-counter, socket, and port checks into focused internal functions while preserving one-file deployment.
+- Hardened root-run output, evidence, monitor log, and PID paths against symbolic-link overwrite risks and applied private default permissions.
+- Fixed background monitor control when the script is renamed, retained startup errors in the monitor log, and safely quoted generated stop commands.
+- Expanded smoke coverage for UDP validation, symbolic-link rejection, and renamed monitor lifecycle control.
+
 ## 1.1.0 - 2026-07-26
 
 - Added `vps-health-monitor.sh` with foreground/background control, PID-safe `start`/`status`/`stop`, threshold cooldown, and size-based log rotation.
