@@ -27,6 +27,9 @@ sudo bash /tmp/vps-health-check.sh --probe-log /root/probe.log --mtr
 # Check local TCP/UDP listeners and remote TCP targets
 sudo bash /tmp/vps-health-check.sh --port 443 --udp-port 53 --tcp example.com:443
 
+# Check a business hostname and HTTP(S) endpoint timings
+sudo bash /tmp/vps-health-check.sh --dns example.com --http https://example.com/health
+
 # English CLI output
 sudo bash /tmp/vps-health-check.sh --lang en
 ```
@@ -71,6 +74,8 @@ Elevated CPU steal can indicate host CPU contention or oversubscription. Elevate
 External monitoring outages with no matching guest OOM, reboot, stopped service, kernel lockup, or NIC link-down event are a valid reason to escalate host-node, upstream-routing, or DDoS-mitigation investigation. They still do not prove one specific cause.
 
 Lifetime NIC, TCP, listen-queue, and softnet counters are preserved as context, but only growth during the current check raises a health finding. This avoids treating an old, already-resolved event as a current outage. IPv6 egress is tested only when both a global IPv6 address and a default IPv6 route exist.
+
+Repeatable `--http` checks report HTTP status plus DNS, connect, TLS, first-byte, and total timing, and inspect HTTPS certificate expiry. Repeatable `--dns` checks validate the actual business hostnames you care about. URL query strings and fragments are omitted from evidence, and embedded URL credentials are rejected.
 
 ## Safety and privacy
 

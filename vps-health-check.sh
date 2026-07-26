@@ -23,6 +23,8 @@ SERVICES=()
 PORTS=()
 UDP_PORTS=()
 TCP_TARGETS=()
+HTTP_TARGETS=()
+DNS_TARGETS=()
 
 PASS_COUNT=0
 WARN_COUNT=0
@@ -71,6 +73,9 @@ FLAG_TCP_RETRANS=0
 FLAG_SYN_BACKLOG=0
 FLAG_PORT_CHECK=0
 FLAG_TCP_TARGET=0
+FLAG_HTTP_ENDPOINT=0
+FLAG_DNS_TARGET=0
+FLAG_TLS_EXPIRY=0
 DEFAULT_IFACE=""
 NET_RX_ERRORS_START=0
 NET_TX_ERRORS_START=0
@@ -103,6 +108,7 @@ WATCH_STOP=0
 RECOMMENDATIONS_ZH=()
 RECOMMENDATIONS_EN=()
 TICKET_FACTS=()
+ENDPOINT_EVIDENCE=()
 
 usage() {
     cat <<'EOF'
@@ -118,6 +124,8 @@ VPS 健康与网络诊断脚本
   --port N           检查本机 TCP 端口是否监听，可重复使用
   --udp-port N       检查本机 UDP 端口是否监听，可重复使用
   --tcp HOST:PORT    探测远端 TCP 端口，可重复使用（IPv4/主机名）
+  --http URL         检查 HTTP(S) 状态与分阶段耗时，可重复使用
+  --dns DOMAIN       检查指定业务域名解析，可重复使用
   --probe-log FILE   导入外部探针的 lost/back 记录并放入证据包
   --monitor-log FILE 导入 vps-health-monitor.sh 的后台异常日志
   --mtr              如果系统已安装 mtr，附加路由质量报告
@@ -132,6 +140,7 @@ VPS 健康与网络诊断脚本
   sudo bash vps-health-check.sh
   sudo bash vps-health-check.sh --service xray --service nginx --mtr
   sudo bash vps-health-check.sh --port 22 --port 443 --udp-port 53 --tcp example.com:443
+  sudo bash vps-health-check.sh --http https://example.com --dns example.com
   sudo bash vps-health-check.sh --probe-log probe.log --mtr
   sudo bash vps-health-check.sh --monitor-log /var/log/vps-health-monitor/monitor.log
   sudo bash vps-health-check.sh --watch 3600 --interval 5
@@ -176,6 +185,16 @@ while (($# > 0)); do
         --tcp)
             [[ $# -ge 2 ]] || { echo "--tcp requires HOST:PORT" >&2; exit 2; }
             TCP_TARGETS+=("$2")
+            shift 2
+            ;;
+        --http)
+            [[ $# -ge 2 ]] || { echo "--http requires a URL" >&2; exit 2; }
+            HTTP_TARGETS+=("$2")
+            shift 2
+            ;;
+        --dns)
+            [[ $# -ge 2 ]] || { echo "--dns requires a domain" >&2; exit 2; }
+            DNS_TARGETS+=("$2")
             shift 2
             ;;
         --probe-log)
@@ -261,6 +280,24 @@ for tcp_target in "${TCP_TARGETS[@]}"; do
     tcp_port="${tcp_target##*:}"
     if [[ "$tcp_target" != *:* || ! "$tcp_host" =~ ^[A-Za-z0-9._-]+$ ]] || ! is_uint "$tcp_port" || ((tcp_port < 1 || tcp_port > 65535)); then
         echo "--tcp must use HOST:PORT with a valid IPv4 address or hostname: $tcp_target" >&2
+        exit 2
+    fi
+done
+for http_target in "${HTTP_TARGETS[@]}"; do
+    if [[ ! "$http_target" =~ ^https?://[^[:space:]]+$ ]]; then
+        echo "--http must use an http:// or https:// URL: $http_target" >&2
+        exit 2
+    fi
+    http_authority="${http_target#*://}"
+    http_authority="${http_authority%%/*}"
+    if [[ "$http_authority" == *@* ]]; then
+        echo "--http does not accept credentials embedded in URLs" >&2
+        exit 2
+    fi
+done
+for dns_target in "${DNS_TARGETS[@]}"; do
+    if [[ ! "$dns_target" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo "--dns must use a valid domain or hostname: $dns_target" >&2
         exit 2
     fi
 done
@@ -985,6 +1022,147 @@ check_ipv6_connectivity() {
     fi
 }
 
+milliseconds_now() {
+    local value
+    value="$(date +%s%3N 2>/dev/null || true)"
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$value"
+    else
+        printf '%s000' "$(date +%s)"
+    fi
+}
+
+redacted_url() {
+    local url="$1"
+    url="${url%%\?*}"
+    url="${url%%\#*}"
+    printf '%s' "$url"
+}
+
+check_dns_targets() {
+    ((${#DNS_TARGETS[@]} > 0)) || return 0
+    if ! command_exists getent; then
+        status_line WARN "$(tr_text '缺少 getent，无法检查指定业务域名' 'getent is unavailable; requested DNS checks were skipped')"
+        return
+    fi
+
+    local domain lookup_output addresses started ended elapsed
+    for domain in "${DNS_TARGETS[@]}"; do
+        started="$(milliseconds_now)"
+        lookup_output="$(getent ahosts "$domain" 2>/dev/null || true)"
+        ended="$(milliseconds_now)"
+        elapsed=$((ended - started))
+        addresses="$(printf '%s\n' "$lookup_output" | awk 'NF > 0 && !seen[$1]++ {print $1}' | head -n 5 | paste -sd, -)"
+        if [[ -z "$addresses" ]]; then
+            FLAG_DNS_TARGET=1
+            status_line FAIL "$(tr_text '业务域名解析失败' 'Business-domain resolution failed'): $domain"
+            ENDPOINT_EVIDENCE+=("DNS domain=$domain status=failed elapsed_ms=$elapsed")
+            add_ticket_fact "DNS resolution failed for the requested business hostname: $domain."
+        elif ((elapsed >= 2000)); then
+            FLAG_DNS_TARGET=1
+            status_line WARN "$(tr_text '业务域名解析较慢' 'Business-domain resolution was slow'): $domain ${elapsed}ms ($addresses)"
+            ENDPOINT_EVIDENCE+=("DNS domain=$domain status=slow elapsed_ms=$elapsed addresses=$addresses")
+        else
+            status_line PASS "DNS $domain: ${elapsed}ms ($addresses)"
+            ENDPOINT_EVIDENCE+=("DNS domain=$domain status=ok elapsed_ms=$elapsed addresses=$addresses")
+        fi
+    done
+}
+
+check_tls_expiry() {
+    local url="$1" safe_url authority host port=443 remainder connect_host cert_end not_after end_epoch now_epoch days
+    safe_url="$(redacted_url "$url")"
+    command_exists openssl && command_exists timeout || {
+        status_line INFO "$(tr_text '缺少 openssl 或 timeout，跳过 TLS 到期检查' 'openssl or timeout is unavailable; skipped TLS-expiry check'): $safe_url"
+        return
+    }
+
+    authority="${url#https://}"
+    authority="${authority%%/*}"
+    authority="${authority%%\?*}"
+    authority="${authority##*@}"
+    if [[ "$authority" == \[* ]]; then
+        host="${authority#\[}"
+        host="${host%%\]*}"
+        remainder="${authority#*\]}"
+        [[ "$remainder" == :* ]] && port="${remainder#:}"
+        connect_host="[$host]"
+    else
+        host="${authority%%:*}"
+        [[ "$authority" == *:* ]] && port="${authority##*:}"
+        connect_host="$host"
+    fi
+    if [[ -z "$host" || ! "$port" =~ ^[0-9]+$ ]]; then
+        status_line INFO "$(tr_text '无法解析 TLS 检查目标' 'Could not parse TLS check target'): $safe_url"
+        return
+    fi
+
+    cert_end="$(timeout 8 openssl s_client -connect "${connect_host}:${port}" -servername "$host" </dev/null 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null || true)"
+    not_after="${cert_end#notAfter=}"
+    if [[ -z "$cert_end" || "$not_after" == "$cert_end" ]]; then
+        FLAG_TLS_EXPIRY=1
+        status_line WARN "$(tr_text '无法读取 TLS 证书到期时间' 'Could not read TLS certificate expiry'): $safe_url"
+        ENDPOINT_EVIDENCE+=("TLS url=$safe_url status=expiry-unavailable")
+        return
+    fi
+
+    end_epoch="$(date -d "$not_after" +%s 2>/dev/null || true)"
+    now_epoch="$(date +%s)"
+    if [[ ! "$end_epoch" =~ ^[0-9]+$ ]]; then
+        status_line INFO "TLS $safe_url: not_after=$not_after"
+        ENDPOINT_EVIDENCE+=("TLS url=$safe_url status=ok not_after=$not_after")
+        return
+    fi
+    days=$(((end_epoch - now_epoch) / 86400))
+    ENDPOINT_EVIDENCE+=("TLS url=$safe_url days_remaining=$days not_after=$not_after")
+    if ((days < 0)); then
+        FLAG_TLS_EXPIRY=2
+        status_line FAIL "$(tr_text 'TLS 证书已过期' 'TLS certificate has expired'): $safe_url ($not_after)"
+    elif ((days < 7)); then
+        FLAG_TLS_EXPIRY=2
+        status_line FAIL "$(tr_text 'TLS 证书将在 7 天内到期' 'TLS certificate expires within 7 days'): $safe_url (${days}d)"
+    elif ((days < 30)); then
+        ((FLAG_TLS_EXPIRY < 1)) && FLAG_TLS_EXPIRY=1
+        status_line WARN "$(tr_text 'TLS 证书将在 30 天内到期' 'TLS certificate expires within 30 days'): $safe_url (${days}d)"
+    else
+        status_line PASS "TLS $safe_url: ${days}d remaining"
+    fi
+}
+
+check_http_targets() {
+    ((${#HTTP_TARGETS[@]} > 0)) || return 0
+    if ! command_exists curl; then
+        status_line WARN "$(tr_text '缺少 curl，无法检查指定 HTTP(S) 端点' 'curl is unavailable; requested HTTP(S) checks were skipped')"
+        return
+    fi
+
+    local url safe_url metrics code dns_time connect_time tls_time first_byte total_time remote_ip effective_url
+    for url in "${HTTP_TARGETS[@]}"; do
+        safe_url="$(redacted_url "$url")"
+        if metrics="$(curl -sS -L --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{remote_ip}|%{url_effective}' "$url" 2>/dev/null)"; then
+            IFS='|' read -r code dns_time connect_time tls_time first_byte total_time remote_ip effective_url <<<"$metrics"
+            effective_url="$(redacted_url "$effective_url")"
+            ENDPOINT_EVIDENCE+=("HTTP url=$safe_url code=$code dns_s=$dns_time connect_s=$connect_time tls_s=$tls_time first_byte_s=$first_byte total_s=$total_time remote_ip=$remote_ip effective_url=$effective_url")
+            if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
+                status_line PASS "HTTP $safe_url: code=$code dns=${dns_time}s connect=${connect_time}s tls=${tls_time}s ttfb=${first_byte}s total=${total_time}s ip=$remote_ip"
+            elif [[ "$code" =~ ^4[0-9][0-9]$ ]]; then
+                FLAG_HTTP_ENDPOINT=1
+                status_line WARN "$(tr_text 'HTTP 端点返回客户端错误' 'HTTP endpoint returned a client error'): $safe_url ($code, total=${total_time}s)"
+            else
+                FLAG_HTTP_ENDPOINT=2
+                status_line FAIL "$(tr_text 'HTTP 端点返回服务端错误' 'HTTP endpoint returned a server error'): $safe_url (${code:-000}, total=${total_time}s)"
+                add_ticket_fact "The requested HTTP endpoint returned status ${code:-000}: $safe_url."
+            fi
+            [[ "$url" == https://* ]] && check_tls_expiry "$url"
+        else
+            FLAG_HTTP_ENDPOINT=2
+            status_line FAIL "$(tr_text 'HTTP 端点连接失败' 'HTTP endpoint connection failed'): $safe_url"
+            ENDPOINT_EVIDENCE+=("HTTP url=$safe_url code=000 status=connection-failed")
+            add_ticket_fact "The requested HTTP endpoint could not be reached from the guest: $safe_url."
+        fi
+    done
+}
+
 check_connectivity() {
     section "$(tr_text '外网连通性' 'Internet connectivity')"
 
@@ -1024,6 +1202,8 @@ check_connectivity() {
     fi
 
     check_ipv6_connectivity
+    check_dns_targets
+    check_http_targets
 
     if ((RUN_MTR == 1)); then
         if command_exists mtr; then
@@ -1374,6 +1554,24 @@ build_system_recommendations() {
 }
 
 build_network_recommendations() {
+    if ((FLAG_DNS_TARGET > 0)); then
+        add_recommendation \
+            "指定业务域名解析失败或明显偏慢。先核对 /etc/resolv.conf、systemd-resolved 和权威 DNS；若多个无关域名同时异常，再排查 VPS 出口或上游 DNS。" \
+            "A requested business hostname failed to resolve or resolved slowly. Check the local resolver and authoritative DNS first; failures across unrelated domains more strongly indicate guest egress or upstream DNS trouble."
+    fi
+
+    if ((FLAG_HTTP_ENDPOINT > 0)); then
+        add_recommendation \
+            "指定 HTTP(S) 业务端点连接失败或返回异常状态。利用报告中的 DNS、连接、TLS、首字节分阶段耗时判断故障位于解析、网络、证书还是应用；只有多个无关端点同时连接失败时才更像上游问题。" \
+            "A requested HTTP(S) endpoint failed or returned an abnormal status. Use the DNS, connect, TLS, first-byte, and total timings to separate resolver, network, certificate, and application faults; simultaneous failures across unrelated endpoints more strongly indicate upstream trouble."
+    fi
+
+    if ((FLAG_TLS_EXPIRY > 0)); then
+        add_recommendation \
+            "TLS 证书即将到期、已过期或无法读取。检查证书链、SNI、自动续期任务和反向代理配置；这通常是业务配置问题，不应先归因于 VPS 线路。" \
+            "A TLS certificate is near expiry, expired, or unreadable. Check the chain, SNI, renewal job, and reverse-proxy configuration; this is usually an application configuration issue before a VPS network issue."
+    fi
+
     if ((FLAG_CONNTRACK > 0)); then
         add_recommendation \
             "连接跟踪表使用率偏高，检查 ss -s、连接洪泛、NAT/代理并发和防火墙规则；耗尽时会表现为新连接随机失败。" \
@@ -1569,6 +1767,9 @@ collect_raw_network_services() {
 
     if command_exists journalctl; then
         journalctl -b -1 -p warning..alert --no-pager 2>/dev/null >"$BUNDLE_DIR/raw/previous-boot-warnings.txt" || true
+    fi
+    if ((${#ENDPOINT_EVIDENCE[@]} > 0)); then
+        printf '%s\n' "${ENDPOINT_EVIDENCE[@]}" >"$BUNDLE_DIR/raw/endpoints.txt"
     fi
 }
 

@@ -13,6 +13,8 @@ help_output="$(bash "$SCRIPT" --help)"
 [[ "$help_output" == *"--probe-log FILE"* ]]
 [[ "$help_output" == *"--monitor-log FILE"* ]]
 [[ "$help_output" == *"--udp-port N"* ]]
+[[ "$help_output" == *"--http URL"* ]]
+[[ "$help_output" == *"--dns DOMAIN"* ]]
 monitor_help="$(bash "$ROOT_DIR/vps-health-monitor.sh" --help)"
 [[ "$monitor_help" == *"start             后台启动监控"* ]]
 
@@ -34,6 +36,18 @@ invalid_udp_port_rc=$?
 set -e
 [[ "$invalid_udp_port_rc" -eq 2 ]]
 
+set +e
+bash "$SCRIPT" --http ftp://example.com >/dev/null 2>&1
+invalid_http_rc=$?
+bash "$SCRIPT" --http https://user:password@example.com >/dev/null 2>&1
+credential_http_rc=$?
+bash "$SCRIPT" --dns 'bad/domain' >/dev/null 2>&1
+invalid_dns_rc=$?
+set -e
+[[ "$invalid_http_rc" -eq 2 ]]
+[[ "$credential_http_rc" -eq 2 ]]
+[[ "$invalid_dns_rc" -eq 2 ]]
+
 if [[ "$(uname -s)" == Linux* ]]; then
     symlink_target="$TEST_DIR/symlink-target.log"
     symlink_report="$TEST_DIR/symlink-report.log"
@@ -48,7 +62,7 @@ fi
 
 report="$TEST_DIR/smoke.log"
 set +e
-bash "$SCRIPT" --target 127.0.0.1 --port 22 --udp-port 53 --tcp example.com:443 --hours 1 --probe-log "$ROOT_DIR/examples/probe.log" --output "$report" --no-color >"$TEST_DIR/stdout.txt" 2>"$TEST_DIR/stderr.txt"
+bash "$SCRIPT" --target 127.0.0.1 --port 22 --udp-port 53 --tcp example.com:443 --dns localhost --http 'http://127.0.0.1:1/health?token=must-not-leak' --hours 1 --probe-log "$ROOT_DIR/examples/probe.log" --output "$report" --no-color >"$TEST_DIR/stdout.txt" 2>"$TEST_DIR/stderr.txt"
 run_rc=$?
 set -e
 [[ "$run_rc" -ge 0 && "$run_rc" -le 2 ]]
@@ -66,6 +80,12 @@ bundle="${report%.*}-evidence"
 [[ -s "$bundle/review-prompt.txt" ]]
 [[ -s "$bundle/raw/external-probe.log" ]]
 [[ -s "$bundle/raw/pressure-and-limits.txt" ]]
+[[ -s "$bundle/raw/endpoints.txt" ]]
+if command -v getent >/dev/null 2>&1; then
+    grep -q 'DNS domain=localhost status=ok' "$bundle/raw/endpoints.txt"
+fi
+grep -q 'HTTP url=http://127.0.0.1:1/health code=000 status=connection-failed' "$bundle/raw/endpoints.txt"
+! grep -R -q 'must-not-leak' "$bundle"
 grep -q 'External monitoring recorded 2 unreachable/lost events' "$bundle/provider-ticket-en.txt"
 grep -q '自动定责' "$ROOT_DIR/README.md"
 

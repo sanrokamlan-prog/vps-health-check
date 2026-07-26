@@ -133,6 +133,7 @@ PASS=18  WARN=2  FAIL=0
 | 网卡 | 默认出口接口、operstate、RX/TX error/drop 基线与检查期间增量、link-down、watchdog |
 | 路由 | 默认路由、完整路由表、出口接口定位 |
 | 连通性 | 多目标 Ping、丢包率、平均延迟、DNS、IPv4/IPv6 HTTPS；仅在 IPv6 配置完整时测试 |
+| 业务端点 | `--dns` 指定域名解析耗时、`--http` HTTP 状态和 DNS/连接/TLS/首字节/总耗时、证书到期 |
 | 连接状态 | Socket 摘要、conntrack、TCP 重传、SYN-RECV、监听/积压队列与 softnet 检查期间增量 |
 | 链路质量 | 可选 MTR 原始报告 |
 | 间歇故障 | `--watch` 持续记录带时区的 `UP/DOWN` 事件 |
@@ -171,6 +172,16 @@ sudo bash /tmp/vps-health-check.sh \
   --service nginx \
   --mtr
 ```
+
+检查实际业务域名与 HTTPS 端点：
+
+```bash
+sudo bash /tmp/vps-health-check.sh \
+  --dns example.com \
+  --http https://example.com/health
+```
+
+URL 查询参数和片段不会写入报告，带有内嵌账号密码的 URL 会被拒绝，避免 Token 或凭据进入证据包。
 
 ### 记录一小时网络状态
 
@@ -339,6 +350,8 @@ vps-health-*-evidence/
 --port N           检查本机 TCP 端口是否监听，可重复使用
 --udp-port N       检查本机 UDP 端口是否绑定，可重复使用
 --tcp HOST:PORT    探测远端 TCP 端口，可重复使用（IPv4/主机名）
+--http URL         检查 HTTP(S) 状态、分阶段耗时与 TLS 到期，可重复使用
+--dns DOMAIN       检查指定业务域名解析，可重复使用
 --mtr              系统已安装 mtr 时生成路由报告
 --watch [SECONDS]  持续探测；不填秒数则运行到 Ctrl+C
 --interval N       持续探测间隔，默认 5 秒
