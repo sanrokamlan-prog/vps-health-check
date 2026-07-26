@@ -364,6 +364,8 @@ case "$COMMAND" in
             echo "Log: $LOG_FILE"
             exit 1
         fi
+        # The child and nohup diagnostics intentionally append to one log; neither reads it.
+        # shellcheck disable=SC2094
         nohup bash "$SCRIPT_PATH" run \
             --interval "$INTERVAL" \
             --duration "$DURATION" \
