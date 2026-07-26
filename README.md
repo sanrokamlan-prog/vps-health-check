@@ -275,6 +275,7 @@ vps-health-*-evidence/
 ├── report.txt               # 完整检查报告
 ├── provider-ticket-en.txt   # 可直接修改并提交的英文工单
 ├── review-prompt.txt        # 管理员 / AI 结构化审查提示词
+├── redaction-manifest.txt   # 仅 --redact：脱敏范围与剩余边界
 └── raw/
     ├── system.txt           # 系统、启动与虚拟化信息
     ├── resources.txt        # 内存、磁盘、vmstat、进程摘要
@@ -288,6 +289,14 @@ vps-health-*-evidence/
 ```
 
 统一时间线会归一化当前启动、外部探针、后台监控和前台 `--watch` 事件。它用于把相同时间附近的证据放在一起复核，不会仅凭时间接近自动判定厂商责任。`summary.json` 带有 `schema_version`，适合 Agent、脚本或面板稳定读取。
+
+公开分享前可以启用脱敏模式：
+
+```bash
+sudo bash /tmp/vps-health-check.sh --redact
+```
+
+保存的报告和证据会隐藏 IPv4、检测到的接口地址、VPS 主机名、配置的探测目标和业务域名，并使用不含主机名的默认文件名。脱敏是尽力而为：进程名、用户名、服务名和脚本无法识别的业务标识不会被猜测删除，公开发布前仍需检查 `redaction-manifest.txt` 与整个证据包。
 
 证据包默认还会压缩为：
 
@@ -374,6 +383,7 @@ vps-health-*-evidence/
 --output FILE      指定主报告路径
 --lang zh|en       中文或英文输出
 --no-color         禁用终端颜色
+--redact           对保存的报告和证据包隐藏已知主机与网络标识
 -h, --help         显示帮助
 ```
 

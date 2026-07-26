@@ -77,6 +77,7 @@ The script creates a report and a compressed evidence bundle containing:
 - `report.txt`: the complete console report without ANSI colors;
 - `provider-ticket-en.txt`: an editable English provider ticket;
 - `review-prompt.txt`: a structured prompt for administrator or AI review;
+- `redaction-manifest.txt`: present with `--redact`, documenting the applied best-effort redaction and its limits;
 - `raw/`: system, pressure/limits, resource, network, service, kernel, probe, monitor, and optional MTR evidence.
 
 ## Interpreting host-contention signals
@@ -88,6 +89,8 @@ External monitoring outages with no matching guest OOM, reboot, stopped service,
 Lifetime NIC, TCP, listen-queue, and softnet counters are preserved as context, but only growth during the current check raises a health finding. This avoids treating an old, already-resolved event as a current outage. IPv6 egress is tested only when both a global IPv6 address and a default IPv6 route exist.
 
 Repeatable `--http` checks report HTTP status plus DNS, connect, TLS, first-byte, and total timing, and inspect HTTPS certificate expiry. Repeatable `--dns` checks validate the actual business hostnames you care about. URL query strings and fragments are omitted from evidence, and embedded URL credentials are rejected.
+
+Use `--redact` before sharing more broadly. Saved evidence then replaces IPv4 addresses, detected interface addresses, the guest hostname, configured probe targets, and known business hostnames, and the default output filename omits the hostname. This is best effort: review the manifest and bundle because process, user, service, and unknown application identifiers remain.
 
 ## Safety and privacy
 

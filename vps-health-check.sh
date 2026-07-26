@@ -13,6 +13,7 @@ WATCH_DURATION=""
 RUN_MTR=0
 LANGUAGE="zh"
 NO_COLOR=0
+REDACT=0
 OUTPUT_FILE=""
 PROBE_LOG=""
 MONITOR_LOG=""
@@ -111,6 +112,7 @@ RECOMMENDATIONS_EN=()
 TICKET_FACTS=()
 ENDPOINT_EVIDENCE=()
 TIMELINE_EVENTS=()
+REDACTION_VALUES=()
 
 usage() {
     cat <<'EOF'
@@ -136,6 +138,7 @@ VPS 健康与网络诊断脚本
   --output FILE      指定报告文件（默认：/tmp/vps-health-*.log）
   --lang zh|en       输出语言（默认：zh）
   --no-color         禁用终端颜色
+  --redact           对保存的报告和证据包隐藏 IP、主机名与已知业务域名
   -h, --help         显示帮助
 
 示例：
@@ -241,6 +244,10 @@ while (($# > 0)); do
             NO_COLOR=1
             shift
             ;;
+        --redact)
+            REDACT=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -337,7 +344,11 @@ host_name="$(hostname 2>/dev/null || printf 'unknown')"
 safe_host="${host_name//[^A-Za-z0-9._-]/_}"
 timestamp="$(date +%Y%m%d-%H%M%S)"
 if [[ -z "$OUTPUT_FILE" ]]; then
-    OUTPUT_FILE="/tmp/vps-health-${safe_host}-${timestamp}.log"
+    if ((REDACT == 1)); then
+        OUTPUT_FILE="/tmp/vps-health-redacted-${timestamp}.log"
+    else
+        OUTPUT_FILE="/tmp/vps-health-${safe_host}-${timestamp}.log"
+    fi
 fi
 BUNDLE_DIR="${OUTPUT_FILE%.*}-evidence"
 BUNDLE_ARCHIVE="${BUNDLE_DIR}.tar.gz"
@@ -1997,6 +2008,99 @@ write_summary_json() {
     } >"$BUNDLE_DIR/summary.json"
 }
 
+add_redaction_value() {
+    local value="$1" existing
+    value="${value%/}"
+    [[ ${#value} -ge 3 && "$value" != "unknown" ]] || return 0
+    for existing in "${REDACTION_VALUES[@]}"; do
+        [[ "$existing" == "$value" ]] && return 0
+    done
+    REDACTION_VALUES+=("$value")
+}
+
+prepare_redaction_values() {
+    local value target authority host resolver_key resolver_value
+    add_redaction_value "$host_name"
+    add_redaction_value "$(hostname -f 2>/dev/null || true)"
+    for target in "${TARGETS[@]}" "${DNS_TARGETS[@]}"; do
+        add_redaction_value "$target"
+    done
+    for target in "${TCP_TARGETS[@]}"; do
+        add_redaction_value "${target%:*}"
+    done
+    for target in "${HTTP_TARGETS[@]}"; do
+        authority="${target#*://}"
+        authority="${authority%%/*}"
+        authority="${authority%%\?*}"
+        authority="${authority##*@}"
+        if [[ "$authority" == \[* ]]; then
+            host="${authority#\[}"
+            host="${host%%\]*}"
+        else
+            host="${authority%%:*}"
+        fi
+        add_redaction_value "$host"
+    done
+    if command_exists ip; then
+        while IFS= read -r value; do
+            add_redaction_value "${value%/*}"
+        done < <(ip -o address show 2>/dev/null | awk '{print $4}')
+    fi
+    if [[ -r /etc/resolv.conf ]]; then
+        while read -r resolver_key resolver_value _rest; do
+            case "$resolver_key" in
+                nameserver|search|domain) add_redaction_value "$resolver_value" ;;
+            esac
+        done </etc/resolv.conf
+    fi
+}
+
+redact_literal_in_file() {
+    local file="$1" needle="$2" replacement="$3" temp_file="$TMP_DIR/redact-literal.$RANDOM"
+    awk -v needle="$needle" -v replacement="$replacement" '
+        {
+            line = $0
+            output = ""
+            while ((position = index(line, needle)) > 0) {
+                output = output substr(line, 1, position - 1) replacement
+                line = substr(line, position + length(needle))
+            }
+            print output line
+        }
+    ' "$file" >"$temp_file" && mv -f -- "$temp_file" "$file"
+}
+
+redact_ipv4_in_file() {
+    local file="$1" temp_file="$TMP_DIR/redact-ipv4.$RANDOM"
+    awk '{gsub(/[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?/, "[REDACTED-IPV4]"); print}' "$file" >"$temp_file" && mv -f -- "$temp_file" "$file"
+}
+
+redact_evidence() {
+    local file value index=0
+    prepare_redaction_values
+    while IFS= read -r -d '' file; do
+        for value in "${REDACTION_VALUES[@]}"; do
+            redact_literal_in_file "$file" "$value" "[REDACTED]"
+        done
+        redact_ipv4_in_file "$file"
+    done < <(find "$BUNDLE_DIR" -type f -print0)
+
+    for file in "$BUNDLE_DIR"/raw/mtr-*.txt; do
+        [[ -e "$file" ]] || continue
+        ((index += 1))
+        mv -f -- "$file" "$BUNDLE_DIR/raw/mtr-target-${index}.txt"
+    done
+    for value in "${REDACTION_VALUES[@]}"; do
+        redact_literal_in_file "$OUTPUT_FILE" "$value" "[REDACTED]"
+    done
+    redact_ipv4_in_file "$OUTPUT_FILE"
+    cat >"$BUNDLE_DIR/redaction-manifest.txt" <<'EOF'
+Best-effort redaction was applied to saved text evidence.
+IPv4 addresses, detected interface addresses, the guest hostname, configured probe targets, and configured business hostnames were replaced.
+Review the bundle before public sharing: process/user/service names and unknown application-specific identifiers are intentionally not guessed or removed.
+EOF
+}
+
 finalize_evidence_bundle() {
     collect_raw_evidence
     write_summary_markdown
@@ -2006,6 +2110,7 @@ finalize_evidence_bundle() {
     write_summary_json
     plain_log "[INFO] Evidence directory: $BUNDLE_DIR"
     cp -- "$OUTPUT_FILE" "$BUNDLE_DIR/report.txt"
+    ((REDACT == 1)) && redact_evidence
 
     printf '%s[INFO]%s %s: %s\n' "$C_BLUE" "$C_RESET" "$(tr_text '证据目录' 'Evidence directory')" "$BUNDLE_DIR"
     if command_exists tar && tar -czf "$BUNDLE_ARCHIVE" -C "$(dirname -- "$BUNDLE_DIR")" "$(basename -- "$BUNDLE_DIR")" 2>/dev/null; then

@@ -15,6 +15,7 @@ help_output="$(bash "$SCRIPT" --help)"
 [[ "$help_output" == *"--udp-port N"* ]]
 [[ "$help_output" == *"--http URL"* ]]
 [[ "$help_output" == *"--dns DOMAIN"* ]]
+[[ "$help_output" == *"--redact"* ]]
 monitor_help="$(bash "$ROOT_DIR/vps-health-monitor.sh" --help)"
 [[ "$monitor_help" == *"start             后台启动监控"* ]]
 [[ "$monitor_help" == *"--network-failures N"* ]]
@@ -105,6 +106,26 @@ if grep -R -q 'must-not-leak' "$bundle"; then
 fi
 grep -q 'External monitoring recorded 2 unreachable/lost events' "$bundle/provider-ticket-en.txt"
 grep -q '自动定责' "$ROOT_DIR/README.md"
+
+redacted_report="$TEST_DIR/redacted.log"
+set +e
+bash "$SCRIPT" --target 127.0.0.1 --dns localhost --http 'http://localhost:1/health?token=redaction-secret' --hours 1 --output "$redacted_report" --redact --no-color >"$TEST_DIR/redacted.out" 2>"$TEST_DIR/redacted.err"
+redacted_rc=$?
+set -e
+[[ "$redacted_rc" -ge 0 && "$redacted_rc" -le 2 ]]
+[[ ! -s "$TEST_DIR/redacted.err" ]]
+redacted_bundle="${redacted_report%.*}-evidence"
+[[ -s "$redacted_bundle/redaction-manifest.txt" ]]
+[[ -s "$redacted_bundle/summary.json" ]]
+if grep -R -E -q '127\.0\.0\.1|localhost|redaction-secret' "$redacted_bundle"; then
+    printf 'known host identity leaked from redacted evidence\n' >&2
+    exit 1
+fi
+if python3 --version >/dev/null 2>&1; then
+    python3 -m json.tool "$redacted_bundle/summary.json" >/dev/null
+elif python --version >/dev/null 2>&1; then
+    python -m json.tool "$redacted_bundle/summary.json" >/dev/null
+fi
 
 monitor_dir="$TEST_DIR/monitor"
 mkdir -p "$monitor_dir"
