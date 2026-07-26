@@ -4,12 +4,12 @@
 
 [中文](README.md) | [Diagnostic guide](docs/diagnosis-guide.md) | [Changelog](CHANGELOG.md)
 
-It checks guest resources, OOM events, kernel and storage errors, NIC state, routing, packet loss, DNS, HTTPS, systemd units, CPU steal, and I/O wait. It then generates actionable recommendations plus material that can be reviewed by a VPS provider, an experienced administrator, or an AI assistant.
+It checks guest resources, OOM events, PSI pressure, cgroup quotas/throttling, process states, kernel and storage errors, NIC state, TCP stack health, routing, packet loss, DNS, HTTPS, systemd units, CPU steal, and I/O wait. It then generates actionable recommendations plus material that can be reviewed by a VPS provider, an experienced administrator, or an AI assistant.
 
 ## Quick start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sanrokamlan-prog/vps-health-check/main/vps-health-check.sh -o /tmp/vps-health-check.sh && sudo bash /tmp/vps-health-check.sh
+curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.1.0/vps-health-check.sh -o /tmp/vps-health-check.sh && sudo bash /tmp/vps-health-check.sh
 ```
 
 Useful examples:
@@ -24,8 +24,34 @@ sudo bash /tmp/vps-health-check.sh --watch 3600 --interval 5
 # Import lost/back timestamps from external monitoring
 sudo bash /tmp/vps-health-check.sh --probe-log /root/probe.log --mtr
 
+# Check local listeners and remote TCP targets
+sudo bash /tmp/vps-health-check.sh --port 443 --tcp example.com:443
+
 # English CLI output
 sudo bash /tmp/vps-health-check.sh --lang en
+```
+
+## Background abnormal-process monitor
+
+One-off checks can miss brief CPU spikes, D-state stalls, pressure events, or runaway processes. The companion monitor writes a snapshot only when thresholds are exceeded and can run unattended in the background:
+
+```bash
+curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.1.0/vps-health-monitor.sh -o /tmp/vps-health-monitor.sh
+
+sudo bash /tmp/vps-health-monitor.sh start \
+  --interval 3 --cpu 70 --memory 40 --load 120 \
+  --cooldown 60 --max-log-mb 20
+
+sudo bash /tmp/vps-health-monitor.sh status
+sudo bash /tmp/vps-health-monitor.sh stop
+```
+
+When an anomaly occurs, it records Top CPU/memory processes without full command arguments, D/Z state, Load, steal, iowait, PSI, `vmstat`, socket summary, and recent kernel warnings. Root defaults to `/var/log/vps-health-monitor/monitor.log`, rotates the log at the configured size, and does not install a system service or persist across reboot.
+
+Import that log into a later evidence bundle:
+
+```bash
+sudo bash /tmp/vps-health-check.sh --monitor-log /var/log/vps-health-monitor/monitor.log
 ```
 
 ## Generated evidence
@@ -36,7 +62,7 @@ The script creates a report and a compressed evidence bundle containing:
 - `report.txt`: the complete console report without ANSI colors;
 - `provider-ticket-en.txt`: an editable English provider ticket;
 - `review-prompt.txt`: a structured prompt for administrator or AI review;
-- `raw/`: system, resource, network, service, kernel, probe, and optional MTR evidence.
+- `raw/`: system, pressure/limits, resource, network, service, kernel, probe, monitor, and optional MTR evidence.
 
 ## Interpreting host-contention signals
 

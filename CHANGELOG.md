@@ -2,6 +2,15 @@
 
 All notable changes are documented in this file.
 
+## 1.1.0 - 2026-07-26
+
+- Added `vps-health-monitor.sh` with foreground/background control, PID-safe `start`/`status`/`stop`, threshold cooldown, and size-based log rotation.
+- Added automatic anomaly snapshots for runaway CPU/memory processes, system load, CPU steal, I/O wait, PSI, D-state/zombie processes, socket summary, `vmstat`, and kernel warnings.
+- Added Linux PSI, cgroup CPU quota/throttling, cgroup memory/PID limits, D/Z process state, file-handle usage, root read-only detection, and recent-reboot diagnostics.
+- Added TCP retransmission, SYN-RECV, listen/backlog drop, softnet, NIC counter delta, local listener, and remote TCP target checks.
+- Added `--monitor-log`, `--port`, and `--tcp` evidence workflows.
+- Expanded raw evidence, provider facts, recommendations, tests, and Chinese/English documentation.
+
 ## 1.0.0 - 2026-07-25
 
 - Added read-only system, resource, service, kernel, storage, NIC, routing, DNS, HTTPS, and packet-loss checks.

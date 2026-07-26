@@ -51,6 +51,26 @@ pidstat -d 1 10
 
 客户机内部日志干净不等于厂商一定有问题，但足以要求厂商核查。把 `provider-ticket-en.txt`、外部探针记录和 MTR 一并提交。
 
+## 快照正常但实际仍有卡顿
+
+一次性检查只能看到运行当时的状态，无法靠人工蹲守捕获几秒钟的进程暴涨、D 状态、steal、iowait 或 PSI 压力。建议启动后台监控：
+
+```bash
+sudo bash vps-health-monitor.sh start \
+  --interval 3 --cpu 70 --memory 40 --load 120 \
+  --cooldown 60 --max-log-mb 20
+```
+
+它只在超过阈值时写入完整快照，同类异常 60 秒内不会重复刷屏。发生问题后将日志并入检查：
+
+```bash
+sudo bash vps-health-check.sh \
+  --monitor-log /var/log/vps-health-monitor/monitor.log \
+  --probe-log /root/probe.log
+```
+
+重点对齐 `ANOMALY`、外部 `lost/back` 和业务异常时间。某个进程持续高 CPU/内存通常先处理客户机；业务空闲但 steal、I/O PSI 或 D 状态反复升高，则更值得要求厂商检查宿主机资源。
+
 ## 如何看 MTR
 
 - 只看最后一跳和之后是否延续丢包，不要因单个中间路由器不回 ICMP 就判断线路故障。

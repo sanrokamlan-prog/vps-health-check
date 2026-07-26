@@ -41,11 +41,12 @@ MTR / 持续监测 ───┘                         └─> 管理员 / AI �
 
 | 项目 | 当前能力 |
 | --- | --- |
-| 当前版本 | `v1.0.0` |
+| 当前版本 | `v1.1.0` |
 | 运行方式 | 单文件 Bash 脚本，下载即用 |
 | 默认语言 | 中文，支持 `--lang en` |
 | 操作边界 | 只读，不改防火墙、不重启服务、不安装软件 |
 | 输出产物 | 主报告、双语摘要、原始证据、英文工单、审查提示词、`tar.gz` 证据包 |
+| 间歇异常 | 独立后台 Top 监控器，异常时自动抓取进程与资源快照 |
 | 适用对象 | VPS 用户、运维人员、服务商支持团队、Linux 管理员、AI Agent |
 
 ---
@@ -55,7 +56,7 @@ MTR / 持续监测 ───┘                         └─> 管理员 / AI �
 下载稳定版并立即检查：
 
 ```bash
-curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.0.0/vps-health-check.sh -o /tmp/vps-health-check.sh && sudo bash /tmp/vps-health-check.sh
+curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.1.0/vps-health-check.sh -o /tmp/vps-health-check.sh && sudo bash /tmp/vps-health-check.sh
 ```
 
 检查结束后，终端会给出报告与证据包路径：
@@ -86,7 +87,7 @@ curl -fsSL https://raw.githubusercontent.com/sanrokamlan-prog/vps-health-check/m
 下面是脚本发现宿主机争用线索与外部中断记录时的典型输出结构：
 
 ```text
-VPS Health Check v1.0.0
+VPS Health Check v1.1.0
 
 == 资源状态 ==
 [PASS] 内存使用率: 41%
@@ -119,9 +120,9 @@ PASS=18  WARN=2  FAIL=0
 
 | 检查域 | 检查内容 |
 | --- | --- |
-| CPU | Load、CPU 数量、CPU steal、I/O wait |
-| 内存 | RAM、Swap、OOM、Killed process |
-| 存储 | 磁盘空间、inode、I/O 与文件系统错误 |
+| CPU | Load、CPU 数量、CPU steal、I/O wait、CPU PSI、cgroup 节流 |
+| 内存 | RAM、Swap、OOM、Killed process、Memory PSI、cgroup 内存上限 |
+| 存储 | 磁盘空间、inode、I/O PSI、D 状态进程、文件系统错误、只读根分区 |
 | 系统 | OS、内核、虚拟化、运行时间、时间同步、启动/关机记录 |
 | 服务 | systemd 失败单元、指定服务状态、累计重启次数 |
 
@@ -129,12 +130,13 @@ PASS=18  WARN=2  FAIL=0
 
 | 检查域 | 检查内容 |
 | --- | --- |
-| 网卡 | 默认出口接口、operstate、RX/TX error、drop、link-down、watchdog |
+| 网卡 | 默认出口接口、operstate、累计与检查期间 RX/TX error/drop、link-down、watchdog |
 | 路由 | 默认路由、完整路由表、出口接口定位 |
 | 连通性 | 多目标 Ping、丢包率、平均延迟、DNS、HTTPS |
-| 连接状态 | Socket 摘要、conntrack 使用率 |
+| 连接状态 | Socket 摘要、conntrack、TCP 重传率、SYN-RECV、监听/积压队列丢弃、softnet |
 | 链路质量 | 可选 MTR 原始报告 |
 | 间歇故障 | `--watch` 持续记录带时区的 `UP/DOWN` 事件 |
+| 端口验证 | `--port` 本机监听检查、`--tcp` 远端 TCP 端口探测 |
 
 ### 面向小白的判断输出
 
@@ -183,11 +185,41 @@ sudo bash /tmp/vps-health-check.sh --watch 3600 --interval 5
 [EVENT] 2026-07-26 00:27:29 +0800 1.1.1.1 UP
 ```
 
+### 后台自动抓取异常 Top 进程
+
+一次性检查没有异常、但 VPS 持有者仍感觉卡顿、断流或偶发失联时，使用后台监控比人工蹲守更可靠：
+
+```bash
+curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.1.0/vps-health-monitor.sh -o /tmp/vps-health-monitor.sh
+
+sudo bash /tmp/vps-health-monitor.sh start \
+  --interval 3 \
+  --cpu 70 \
+  --memory 40 \
+  --load 120 \
+  --cooldown 60 \
+  --max-log-mb 20
+```
+
+监控器默认持续运行，只有异常时才会抓取快照。它记录 Top CPU/内存进程、D/Z 状态、Load、steal、iowait、PSI、`vmstat`、连接摘要和内核警告；不记录完整命令参数，避免敏感信息进入日志。
+
+```bash
+# 查看状态与日志
+sudo bash /tmp/vps-health-monitor.sh status
+sudo tail -f /var/log/vps-health-monitor/monitor.log
+
+# 停止
+sudo bash /tmp/vps-health-monitor.sh stop
+```
+
+默认 root 日志路径为 `/var/log/vps-health-monitor/monitor.log`，超过设定大小后自动轮转为 `.1`。它不注册 systemd 开机自启；需要持久运行时可由你自己的 systemd、supervisor 或面板托管 `run` 子命令。
+
 ### 导入外部探针记录
 
 ```bash
 sudo bash /tmp/vps-health-check.sh \
   --probe-log /root/probe.log \
+  --monitor-log /var/log/vps-health-monitor/monitor.log \
   --mtr
 ```
 
@@ -221,10 +253,12 @@ vps-health-*-evidence/
 └── raw/
     ├── system.txt           # 系统、启动与虚拟化信息
     ├── resources.txt        # 内存、磁盘、vmstat、进程摘要
+    ├── pressure-and-limits.txt # PSI、cgroup 配额、D/Z 状态、句柄与挂载
     ├── network.txt          # 地址、路由、网卡计数、连接摘要
     ├── services.txt         # 失败单元与指定服务状态
     ├── kernel-24h.txt       # 最近 24 小时内核日志
     ├── external-probe.log   # 可选：外部探针原始记录
+    ├── process-monitor.log  # 可选：后台异常进程监控日志
     └── mtr-*.txt            # 可选：MTR 原始结果
 ```
 
@@ -243,6 +277,8 @@ vps-health-*-evidence/
 - 上游路由、终点丢包与回程异常；
 - DDoS 攻击、黑洞或清洗切换；
 - 外部探针记录时间附近的宿主机日志。
+
+如果 `process-monitor.log` 中捕获到异常 Top 快照，工单会附带对应次数，方便厂商与外部探针时间点交叉核对。
 
 它不会把推测伪装成结论，降低工单被厂商用「客户机问题」直接驳回的概率。
 
@@ -295,6 +331,9 @@ vps-health-*-evidence/
 --target HOST      网络探测目标，可重复使用
 --service NAME     检查 systemd 服务，可重复使用
 --probe-log FILE   导入外部探针 lost/back 记录
+--monitor-log FILE 导入 vps-health-monitor.sh 的后台异常日志
+--port N           检查本机 TCP 端口是否监听，可重复使用
+--tcp HOST:PORT    探测远端 TCP 端口，可重复使用（IPv4/主机名）
 --mtr              系统已安装 mtr 时生成路由报告
 --watch [SECONDS]  持续探测；不填秒数则运行到 Ctrl+C
 --interval N       持续探测间隔，默认 5 秒
@@ -327,6 +366,7 @@ vps-health-*-evidence/
 - Bash 4+；
 - root 不是强制要求，但建议使用 `sudo` 获取完整内核和服务日志；
 - `mtr`、`curl`、`ping`、`ip`、`ss` 缺失时会跳过对应项目；
+- 后台监控器需要 `/proc`、`ps` 与标准 Bash 工具；建议以 root 运行以采集内核警告；
 - 脚本不会自行安装依赖或修改系统配置。
 
 ---
@@ -360,6 +400,8 @@ ShellCheck
     ↓
 探针导入与证据包测试
     ↓
+后台异常进程监控与日志导入测试
+    ↓
 持续监测 smoke test
 ```
 
@@ -367,7 +409,7 @@ ShellCheck
 
 ```bash
 bash -n vps-health-check.sh
-shellcheck vps-health-check.sh tests/smoke.sh
+shellcheck vps-health-check.sh vps-health-monitor.sh tests/smoke.sh
 bash tests/smoke.sh
 ```
 

@@ -6,7 +6,7 @@ Before submitting a change:
 
 ```bash
 bash -n vps-health-check.sh
-shellcheck vps-health-check.sh tests/smoke.sh
+shellcheck vps-health-check.sh vps-health-monitor.sh tests/smoke.sh
 bash tests/smoke.sh
 ```
 

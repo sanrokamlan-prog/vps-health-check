@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PROJECT_URL="https://github.com/sanrokamlan-prog/vps-health-check"
 HOURS=24
 INTERVAL=5
@@ -15,9 +15,13 @@ LANGUAGE="zh"
 NO_COLOR=0
 OUTPUT_FILE=""
 PROBE_LOG=""
+MONITOR_LOG=""
+MONITOR_LOG_AUTO=0
 TARGETS=("1.1.1.1" "8.8.8.8")
 TARGETS_OVERRIDDEN=0
 SERVICES=()
+PORTS=()
+TCP_TARGETS=()
 
 PASS_COUNT=0
 WARN_COUNT=0
@@ -30,6 +34,12 @@ BUNDLE_ARCHIVE=""
 # Diagnostic signals used to build recommendations and support material.
 CPU_STEAL_PCT=0
 CPU_IOWAIT_PCT=0
+CGROUP_THROTTLE_PCT=0
+CGROUP_CPU_LIMIT=""
+CGROUP_MEMORY_PCT=0
+PSI_CPU_AVG10=""
+PSI_MEMORY_FULL_AVG10=""
+PSI_IO_FULL_AVG10=""
 FLAG_HIGH_LOAD=0
 FLAG_HIGH_MEMORY=0
 FLAG_HIGH_SWAP=0
@@ -43,12 +53,41 @@ FLAG_STORAGE_ERROR=0
 FLAG_NIC_EVENT=0
 FLAG_NIC_COUNTER=0
 FLAG_CONNTRACK=0
+FLAG_CPU_PRESSURE=0
+FLAG_MEMORY_PRESSURE=0
+FLAG_IO_PRESSURE=0
+FLAG_CGROUP_THROTTLE=0
+FLAG_DSTATE=0
+FLAG_ZOMBIE=0
+FLAG_FILE_HANDLES=0
+FLAG_PID_LIMIT=0
+FLAG_READONLY_ROOT=0
+FLAG_RECENT_REBOOT=0
+FLAG_KERNEL_CRASH=0
+FLAG_TIMEKEEPING=0
+FLAG_NETWORK_STACK=0
+FLAG_TCP_RETRANS=0
+FLAG_SYN_BACKLOG=0
+FLAG_PORT_CHECK=0
+FLAG_TCP_TARGET=0
+DEFAULT_IFACE=""
+NET_RX_ERRORS_START=0
+NET_TX_ERRORS_START=0
+NET_RX_DROPPED_START=0
+NET_TX_DROPPED_START=0
+NET_RX_ERROR_DELTA=0
+NET_TX_ERROR_DELTA=0
+NET_RX_DROP_DELTA=0
+NET_TX_DROP_DELTA=0
+TCP_RETRANS_PCT=0
 PING_TESTS=0
 PING_FAILURES=0
 PING_WARNINGS=0
 DNS_OK=-1
 HTTPS_OK=-1
 PROBE_LOST_COUNT=0
+MONITOR_ANOMALY_COUNT=0
+FLAG_PROCESS_MONITOR=0
 WATCH_FAILURES=0
 WATCH_TRANSITIONS=0
 WATCH_STOP=0
@@ -67,7 +106,10 @@ VPS 健康与网络诊断脚本
   --hours N          检查最近 N 小时的系统日志（默认：24）
   --target HOST      网络探测目标，可重复使用（默认：1.1.1.1、8.8.8.8）
   --service NAME     检查指定 systemd 服务，可重复使用
+  --port N           检查本机 TCP 端口是否监听，可重复使用
+  --tcp HOST:PORT    探测远端 TCP 端口，可重复使用（IPv4/主机名）
   --probe-log FILE   导入外部探针的 lost/back 记录并放入证据包
+  --monitor-log FILE 导入 vps-health-monitor.sh 的后台异常日志
   --mtr              如果系统已安装 mtr，附加路由质量报告
   --watch [SECONDS]  持续探测网络；不填秒数则一直运行，按 Ctrl+C 停止
   --interval N       持续探测间隔秒数（默认：5）
@@ -79,7 +121,9 @@ VPS 健康与网络诊断脚本
 示例：
   sudo bash vps-health-check.sh
   sudo bash vps-health-check.sh --service xray --service nginx --mtr
+  sudo bash vps-health-check.sh --port 22 --port 443 --tcp example.com:443
   sudo bash vps-health-check.sh --probe-log probe.log --mtr
+  sudo bash vps-health-check.sh --monitor-log /var/log/vps-health-monitor/monitor.log
   sudo bash vps-health-check.sh --watch 3600 --interval 5
 EOF
 }
@@ -109,9 +153,24 @@ while (($# > 0)); do
             SERVICES+=("$2")
             shift 2
             ;;
+        --port)
+            [[ $# -ge 2 ]] || { echo "--port requires a value" >&2; exit 2; }
+            PORTS+=("$2")
+            shift 2
+            ;;
+        --tcp)
+            [[ $# -ge 2 ]] || { echo "--tcp requires HOST:PORT" >&2; exit 2; }
+            TCP_TARGETS+=("$2")
+            shift 2
+            ;;
         --probe-log)
             [[ $# -ge 2 ]] || { echo "--probe-log requires a value" >&2; exit 2; }
             PROBE_LOG="$2"
+            shift 2
+            ;;
+        --monitor-log)
+            [[ $# -ge 2 ]] || { echo "--monitor-log requires a value" >&2; exit 2; }
+            MONITOR_LOG="$2"
             shift 2
             ;;
         --mtr)
@@ -170,8 +229,35 @@ if [[ "$LANGUAGE" != "zh" && "$LANGUAGE" != "en" ]]; then
     echo "--lang must be zh or en" >&2
     exit 2
 fi
+for port in "${PORTS[@]}"; do
+    if ! is_uint "$port" || ((port < 1 || port > 65535)); then
+        echo "--port must be between 1 and 65535: $port" >&2
+        exit 2
+    fi
+done
+for tcp_target in "${TCP_TARGETS[@]}"; do
+    tcp_host="${tcp_target%:*}"
+    tcp_port="${tcp_target##*:}"
+    if [[ "$tcp_target" != *:* || ! "$tcp_host" =~ ^[A-Za-z0-9._-]+$ ]] || ! is_uint "$tcp_port" || ((tcp_port < 1 || tcp_port > 65535)); then
+        echo "--tcp must use HOST:PORT with a valid IPv4 address or hostname: $tcp_target" >&2
+        exit 2
+    fi
+done
 if [[ -n "$PROBE_LOG" && ! -r "$PROBE_LOG" ]]; then
     echo "Cannot read probe log: $PROBE_LOG" >&2
+    exit 2
+fi
+if [[ -z "$MONITOR_LOG" ]]; then
+    if [[ -r /var/log/vps-health-monitor/monitor.log ]]; then
+        MONITOR_LOG="/var/log/vps-health-monitor/monitor.log"
+        MONITOR_LOG_AUTO=1
+    elif [[ -r "${HOME:-/tmp}/.local/state/vps-health-monitor/monitor.log" ]]; then
+        MONITOR_LOG="${HOME:-/tmp}/.local/state/vps-health-monitor/monitor.log"
+        MONITOR_LOG_AUTO=1
+    fi
+fi
+if [[ -n "$MONITOR_LOG" && ! -r "$MONITOR_LOG" ]]; then
+    echo "Cannot read monitor log: $MONITOR_LOG" >&2
     exit 2
 fi
 
@@ -291,11 +377,46 @@ add_ticket_fact() {
     TICKET_FACTS+=("$1")
 }
 
+read_key_value() {
+    local file="$1" key="$2"
+    awk -v wanted="$key" '$1 == wanted {print $2; exit}' "$file" 2>/dev/null
+}
+
+psi_avg10() {
+    local file="$1" mode="$2"
+    awk -v wanted="$mode" '$1 == wanted {for (i = 2; i <= NF; i++) if ($i ~ /^avg10=/) {split($i, pair, "="); print pair[2]; exit}}' "$file" 2>/dev/null
+}
+
+decimal_ge() {
+    awk -v value="${1:-0}" -v threshold="$2" 'BEGIN {exit !(value + 0 >= threshold + 0)}'
+}
+
+pressure_status() {
+    local value="$1" warn_at="$2" fail_at="$3" label="$4" flag_name="$5"
+    if decimal_ge "$value" "$fail_at"; then
+        printf -v "$flag_name" '%s' 2
+        status_line FAIL "$label: ${value}%"
+    elif decimal_ge "$value" "$warn_at"; then
+        printf -v "$flag_name" '%s' 1
+        status_line WARN "$label: ${value}%"
+    else
+        status_line PASS "$label: ${value}%"
+    fi
+}
+
 sample_cpu_contention() {
     [[ -r /proc/stat ]] || return 0
 
     local _cpu user nice system idle iowait irq softirq steal _guest _guest_nice
     local total_1 total_2 steal_1 steal_2 iowait_1 iowait_2 delta_total
+    local cgroup_cpu_stat="/sys/fs/cgroup/cpu.stat"
+    local periods_1=0 periods_2=0 throttled_1=0 throttled_2=0 delta_periods=0 delta_throttled=0
+    if [[ -r "$cgroup_cpu_stat" ]]; then
+        periods_1="$(read_key_value "$cgroup_cpu_stat" nr_periods)"
+        throttled_1="$(read_key_value "$cgroup_cpu_stat" nr_throttled)"
+        periods_1="${periods_1:-0}"
+        throttled_1="${throttled_1:-0}"
+    fi
     read -r _cpu user nice system idle iowait irq softirq steal _guest _guest_nice < /proc/stat
     total_1=$((user + nice + system + idle + iowait + irq + softirq + steal))
     steal_1=$steal
@@ -309,6 +430,17 @@ sample_cpu_contention() {
     if ((delta_total > 0)); then
         CPU_STEAL_PCT=$(((steal_2 - steal_1) * 100 / delta_total))
         CPU_IOWAIT_PCT=$(((iowait_2 - iowait_1) * 100 / delta_total))
+    fi
+    if [[ -r "$cgroup_cpu_stat" ]]; then
+        periods_2="$(read_key_value "$cgroup_cpu_stat" nr_periods)"
+        throttled_2="$(read_key_value "$cgroup_cpu_stat" nr_throttled)"
+        periods_2="${periods_2:-0}"
+        throttled_2="${throttled_2:-0}"
+        delta_periods=$((periods_2 - periods_1))
+        delta_throttled=$((throttled_2 - throttled_1))
+        if ((delta_periods > 0 && delta_throttled > 0)); then
+            CGROUP_THROTTLE_PCT=$((delta_throttled * 100 / delta_periods))
+        fi
     fi
 }
 
@@ -346,8 +478,13 @@ check_system() {
     if command_exists uptime; then
         uptime_human="$(uptime -p 2>/dev/null || uptime 2>/dev/null || printf 'unknown')"
     fi
-    if ((uptime_seconds > 0 && uptime_seconds < 600)); then
-        status_line WARN "$(tr_text '系统在 10 分钟内启动过' 'System booted within the last 10 minutes'): $uptime_human"
+    if ((uptime_seconds > 0 && uptime_seconds < HOURS * 3600)); then
+        FLAG_RECENT_REBOOT=1
+        if ((uptime_seconds < 600)); then
+            status_line WARN "$(tr_text '系统在 10 分钟内启动过' 'System booted within the last 10 minutes'): $uptime_human"
+        else
+            status_line WARN "$(tr_text "系统在最近 ${HOURS} 小时内启动过" "System booted within the last ${HOURS} hours"): $uptime_human"
+        fi
     else
         status_line PASS "$(tr_text '运行时间' 'Uptime'): $uptime_human"
     fi
@@ -364,6 +501,10 @@ check_system() {
         elif [[ -n "$synced" ]]; then
             status_line WARN "$(tr_text '系统时间未确认同步' 'System clock is not confirmed synchronized'): $synced"
         fi
+    fi
+
+    if [[ -e /var/run/reboot-required ]]; then
+        status_line INFO "$(tr_text '系统更新提示需要重启（不代表当前故障）' 'A package update requests a reboot; this does not itself indicate a current fault')"
     fi
 }
 
@@ -456,11 +597,139 @@ check_resources() {
     fi
 }
 
+check_pressure_and_limits() {
+    section "$(tr_text '压力、配额与进程健康' 'Pressure, quotas, and process health')"
+
+    if [[ -r /proc/pressure/cpu ]]; then
+        PSI_CPU_AVG10="$(psi_avg10 /proc/pressure/cpu some)"
+        PSI_MEMORY_FULL_AVG10="$(psi_avg10 /proc/pressure/memory full)"
+        PSI_IO_FULL_AVG10="$(psi_avg10 /proc/pressure/io full)"
+        PSI_CPU_AVG10="${PSI_CPU_AVG10:-0}"
+        PSI_MEMORY_FULL_AVG10="${PSI_MEMORY_FULL_AVG10:-0}"
+        PSI_IO_FULL_AVG10="${PSI_IO_FULL_AVG10:-0}"
+        pressure_status "$PSI_CPU_AVG10" 25 60 "$(tr_text 'CPU PSI some avg10' 'CPU PSI some avg10')" FLAG_CPU_PRESSURE
+        pressure_status "$PSI_MEMORY_FULL_AVG10" 2 10 "$(tr_text '内存 PSI full avg10' 'Memory PSI full avg10')" FLAG_MEMORY_PRESSURE
+        pressure_status "$PSI_IO_FULL_AVG10" 2 10 "$(tr_text 'I/O PSI full avg10' 'I/O PSI full avg10')" FLAG_IO_PRESSURE
+    else
+        status_line INFO "$(tr_text '内核未提供 PSI 压力指标' 'Kernel pressure stall information (PSI) is unavailable')"
+    fi
+
+    if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+        local quota period
+        read -r quota period < /sys/fs/cgroup/cpu.max
+        if [[ "$quota" != "max" && "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ && "$period" -gt 0 ]]; then
+            CGROUP_CPU_LIMIT="$(awk -v q="$quota" -v p="$period" 'BEGIN {printf "%.2f", q / p}')"
+            status_line INFO "$(tr_text 'cgroup CPU 配额' 'cgroup CPU quota'): ${CGROUP_CPU_LIMIT} CPU"
+        else
+            status_line INFO "$(tr_text 'cgroup CPU 配额' 'cgroup CPU quota'): unlimited"
+        fi
+        if ((CGROUP_THROTTLE_PCT >= 50)); then
+            FLAG_CGROUP_THROTTLE=2
+            status_line FAIL "$(tr_text '采样期间 cgroup CPU 节流严重' 'Severe cgroup CPU throttling during sample'): ${CGROUP_THROTTLE_PCT}%"
+        elif ((CGROUP_THROTTLE_PCT >= 20)); then
+            FLAG_CGROUP_THROTTLE=1
+            status_line WARN "$(tr_text '采样期间 cgroup CPU 节流偏高' 'Elevated cgroup CPU throttling during sample'): ${CGROUP_THROTTLE_PCT}%"
+        else
+            status_line PASS "$(tr_text 'cgroup CPU 节流周期占比' 'cgroup throttled-period ratio'): ${CGROUP_THROTTLE_PCT}%"
+        fi
+    fi
+
+    if [[ -r /sys/fs/cgroup/memory.current && -r /sys/fs/cgroup/memory.max ]]; then
+        local memory_current memory_max
+        memory_current="$(cat /sys/fs/cgroup/memory.current)"
+        memory_max="$(cat /sys/fs/cgroup/memory.max)"
+        if [[ "$memory_max" != "max" && "$memory_current" =~ ^[0-9]+$ && "$memory_max" =~ ^[0-9]+$ && "$memory_max" -gt 0 ]]; then
+            CGROUP_MEMORY_PCT="$(awk -v current="$memory_current" -v maximum="$memory_max" 'BEGIN {printf "%d", current * 100 / maximum}')"
+            percent_status "$CGROUP_MEMORY_PCT" 85 95 "$(tr_text 'cgroup 内存使用率' 'cgroup memory usage')"
+            if ((CGROUP_MEMORY_PCT >= 85 && FLAG_MEMORY_PRESSURE < 1)); then
+                FLAG_MEMORY_PRESSURE=1
+            fi
+        fi
+    fi
+
+    if [[ -r /sys/fs/cgroup/pids.current && -r /sys/fs/cgroup/pids.max ]]; then
+        local pids_current pids_max pids_pct
+        pids_current="$(cat /sys/fs/cgroup/pids.current)"
+        pids_max="$(cat /sys/fs/cgroup/pids.max)"
+        if [[ "$pids_max" != "max" && "$pids_current" =~ ^[0-9]+$ && "$pids_max" =~ ^[0-9]+$ && "$pids_max" -gt 0 ]]; then
+            pids_pct=$((pids_current * 100 / pids_max))
+            if ((pids_pct >= 95)); then
+                FLAG_PID_LIMIT=2
+                status_line FAIL "$(tr_text 'cgroup PID 配额接近耗尽' 'cgroup PID quota is nearly exhausted'): $pids_current/$pids_max (${pids_pct}%)"
+            elif ((pids_pct >= 80)); then
+                FLAG_PID_LIMIT=1
+                status_line WARN "$(tr_text 'cgroup PID 使用率偏高' 'cgroup PID usage is high'): $pids_current/$pids_max (${pids_pct}%)"
+            else
+                status_line PASS "$(tr_text 'cgroup PID 使用率' 'cgroup PID usage'): $pids_current/$pids_max (${pids_pct}%)"
+            fi
+        fi
+    fi
+
+    if command_exists ps; then
+        local d_count z_count
+        d_count="$(ps -eo stat= 2>/dev/null | awk '$1 ~ /^D/ {count++} END {print count + 0}')"
+        z_count="$(ps -eo stat= 2>/dev/null | awk '$1 ~ /^Z/ {count++} END {print count + 0}')"
+        if ((d_count >= 5)); then
+            FLAG_DSTATE=2
+            status_line FAIL "$(tr_text '不可中断睡眠（D 状态）进程较多' 'Many processes are in uninterruptible D state'): $d_count"
+        elif ((d_count > 0)); then
+            FLAG_DSTATE=1
+            status_line WARN "$(tr_text '发现不可中断睡眠（D 状态）进程' 'Processes in uninterruptible D state found'): $d_count"
+        else
+            status_line PASS "$(tr_text '没有 D 状态进程' 'No processes in uninterruptible D state')"
+        fi
+        if ((z_count >= 20)); then
+            FLAG_ZOMBIE=2
+            status_line FAIL "$(tr_text '僵尸进程过多' 'Too many zombie processes'): $z_count"
+        elif ((z_count > 0)); then
+            FLAG_ZOMBIE=1
+            status_line WARN "$(tr_text '发现僵尸进程' 'Zombie processes found'): $z_count"
+        else
+            status_line PASS "$(tr_text '没有僵尸进程' 'No zombie processes')"
+        fi
+    fi
+
+    if [[ -r /proc/sys/fs/file-nr ]]; then
+        local file_allocated _file_unused file_max file_pct
+        read -r file_allocated _file_unused file_max < /proc/sys/fs/file-nr
+        if ((file_max > 0)); then
+            file_pct=$((file_allocated * 100 / file_max))
+            if ((file_pct >= 90)); then
+                FLAG_FILE_HANDLES=2
+                status_line FAIL "$(tr_text '系统文件句柄接近耗尽' 'System file handles are nearly exhausted'): $file_allocated/$file_max (${file_pct}%)"
+            elif ((file_pct >= 70)); then
+                FLAG_FILE_HANDLES=1
+                status_line WARN "$(tr_text '系统文件句柄使用率偏高' 'System file-handle usage is high'): $file_allocated/$file_max (${file_pct}%)"
+            else
+                status_line PASS "$(tr_text '系统文件句柄使用率' 'System file-handle usage'): $file_allocated/$file_max (${file_pct}%)"
+            fi
+        fi
+    fi
+
+    if command_exists findmnt; then
+        local root_options
+        root_options="$(findmnt -rn -o OPTIONS / 2>/dev/null || true)"
+        if [[ ",$root_options," == *,ro,* ]]; then
+            FLAG_READONLY_ROOT=1
+            status_line FAIL "$(tr_text '根文件系统处于只读状态' 'Root filesystem is mounted read-only'): $root_options"
+        elif [[ -n "$root_options" ]]; then
+            status_line PASS "$(tr_text '根文件系统可写' 'Root filesystem is writable')"
+        fi
+    fi
+}
+
 check_services_and_reboots() {
     section "$(tr_text '服务与启动记录' 'Services and boot history')"
 
     if command_exists systemctl && [[ -d /run/systemd/system ]]; then
-        local failed_units
+        local failed_units system_state
+        system_state="$(systemctl is-system-running 2>/dev/null || true)"
+        if [[ "$system_state" == "running" ]]; then
+            status_line PASS "systemd: running"
+        elif [[ -n "$system_state" ]]; then
+            FLAG_FAILED_UNITS=1
+            status_line WARN "$(tr_text 'systemd 系统状态异常' 'systemd system state is not healthy'): $system_state"
+        fi
         failed_units="$(systemctl --failed --no-legend --plain 2>/dev/null || true)"
         if [[ -n "$failed_units" ]]; then
             FLAG_FAILED_UNITS=1
@@ -527,6 +796,15 @@ check_kernel_events() {
     show_kernel_matches "$kernel_log" \
         'NETDEV WATCHDOG|transmit queue.*timed out|link is down|lost carrier|NIC Link is Down' \
         '网卡掉线/发送超时事件' 'NIC link-down/transmit-timeout events' WARN FLAG_NIC_EVENT
+    show_kernel_matches "$kernel_log" \
+        'segfault|general protection fault|machine check|hardware error|MCE:' \
+        '进程崩溃/硬件异常事件' 'process-crash/hardware-error events' WARN FLAG_KERNEL_CRASH
+    show_kernel_matches "$kernel_log" \
+        'clocksource.*unstable|timekeeping watchdog|time jumped backwards|Time went backwards' \
+        '时钟源/时间跳变事件' 'clocksource/time-jump events' WARN FLAG_TIMEKEEPING
+    show_kernel_matches "$kernel_log" \
+        'nf_conntrack: table full|possible SYN flooding|TCP: out of memory|too many orphaned sockets|Neighbour table overflow' \
+        '内核网络栈溢出/洪泛事件' 'kernel network-stack overflow/flood events' FAIL FLAG_NETWORK_STACK
 }
 
 default_interface() {
@@ -554,6 +832,7 @@ check_network_interface() {
 
     local iface route operstate rx_errors tx_errors rx_dropped tx_dropped
     iface="$(default_interface)"
+    DEFAULT_IFACE="$iface"
     route="$(ip route show default 2>/dev/null | head -n 3 || true)"
     if [[ -z "$iface" ]]; then
         status_line FAIL "$(tr_text '没有找到可用的默认出口接口' 'No usable default egress interface found')"
@@ -573,6 +852,10 @@ check_network_interface() {
     tx_errors="$(read_counter "$iface" tx_errors)"
     rx_dropped="$(read_counter "$iface" rx_dropped)"
     tx_dropped="$(read_counter "$iface" tx_dropped)"
+    NET_RX_ERRORS_START=$rx_errors
+    NET_TX_ERRORS_START=$tx_errors
+    NET_RX_DROPPED_START=$rx_dropped
+    NET_TX_DROPPED_START=$tx_dropped
     status_line INFO "$(tr_text '网卡累计计数' 'Lifetime NIC counters'): RX errors=$rx_errors, TX errors=$tx_errors, RX dropped=$rx_dropped, TX dropped=$tx_dropped"
     if ((rx_errors > 0 || tx_errors > 0)); then
         FLAG_NIC_COUNTER=1
@@ -685,6 +968,140 @@ check_connectivity() {
     fi
 }
 
+netstat_field() {
+    local file="$1" protocol="$2" field="$3"
+    awk -v proto="$protocol" -v wanted="$field" '
+        $1 == proto && !seen_header {
+            for (i = 2; i <= NF; i++) if ($i == wanted) field_index = i
+            seen_header = 1
+            next
+        }
+        $1 == proto && seen_header && field_index > 0 {print $field_index; exit}
+    ' "$file" 2>/dev/null
+}
+
+check_network_stack_and_ports() {
+    section "$(tr_text 'TCP 栈、增量丢包与端口' 'TCP stack, drop deltas, and ports')"
+
+    if [[ -n "$DEFAULT_IFACE" && -d "/sys/class/net/$DEFAULT_IFACE" ]]; then
+        local rx_errors_end tx_errors_end rx_dropped_end tx_dropped_end
+        rx_errors_end="$(read_counter "$DEFAULT_IFACE" rx_errors)"
+        tx_errors_end="$(read_counter "$DEFAULT_IFACE" tx_errors)"
+        rx_dropped_end="$(read_counter "$DEFAULT_IFACE" rx_dropped)"
+        tx_dropped_end="$(read_counter "$DEFAULT_IFACE" tx_dropped)"
+        NET_RX_ERROR_DELTA=$((rx_errors_end - NET_RX_ERRORS_START))
+        NET_TX_ERROR_DELTA=$((tx_errors_end - NET_TX_ERRORS_START))
+        NET_RX_DROP_DELTA=$((rx_dropped_end - NET_RX_DROPPED_START))
+        NET_TX_DROP_DELTA=$((tx_dropped_end - NET_TX_DROPPED_START))
+        if ((NET_RX_ERROR_DELTA < 0 || NET_TX_ERROR_DELTA < 0 || NET_RX_DROP_DELTA < 0 || NET_TX_DROP_DELTA < 0)); then
+            FLAG_NIC_EVENT=1
+            status_line WARN "$(tr_text '检查期间网卡计数器被重置，可能发生接口重建' 'NIC counters reset during the check; the interface may have been recreated')"
+        elif ((NET_RX_ERROR_DELTA > 0 || NET_TX_ERROR_DELTA > 0 || NET_RX_DROP_DELTA > 0 || NET_TX_DROP_DELTA > 0)); then
+            FLAG_NIC_COUNTER=1
+            status_line WARN "$(tr_text '本次检查期间网卡错误/丢包计数增长' 'NIC errors/drops increased during this check'): RXerr=+$NET_RX_ERROR_DELTA TXerr=+$NET_TX_ERROR_DELTA RXdrop=+$NET_RX_DROP_DELTA TXdrop=+$NET_TX_DROP_DELTA"
+        else
+            status_line PASS "$(tr_text '本次检查期间网卡错误/丢包计数未增长' 'NIC errors/drop counters did not increase during this check')"
+        fi
+    fi
+
+    if [[ -r /proc/net/snmp ]]; then
+        local out_segments retrans_segments
+        out_segments="$(netstat_field /proc/net/snmp 'Tcp:' OutSegs)"
+        retrans_segments="$(netstat_field /proc/net/snmp 'Tcp:' RetransSegs)"
+        out_segments="${out_segments:-0}"
+        retrans_segments="${retrans_segments:-0}"
+        if ((out_segments > 0)); then
+            TCP_RETRANS_PCT="$(awk -v retrans="$retrans_segments" -v sent="$out_segments" 'BEGIN {printf "%d", retrans * 100 / sent}')"
+            if ((out_segments >= 1000 && TCP_RETRANS_PCT >= 15)); then
+                FLAG_TCP_RETRANS=2
+                status_line FAIL "$(tr_text 'TCP 累计重传率很高' 'Lifetime TCP retransmission ratio is very high'): ${TCP_RETRANS_PCT}% ($retrans_segments/$out_segments)"
+            elif ((out_segments >= 1000 && TCP_RETRANS_PCT >= 5)); then
+                FLAG_TCP_RETRANS=1
+                status_line WARN "$(tr_text 'TCP 累计重传率偏高' 'Lifetime TCP retransmission ratio is elevated'): ${TCP_RETRANS_PCT}% ($retrans_segments/$out_segments)"
+            else
+                status_line PASS "$(tr_text 'TCP 累计重传率' 'Lifetime TCP retransmission ratio'): ${TCP_RETRANS_PCT}% ($retrans_segments/$out_segments)"
+            fi
+        fi
+    fi
+
+    if [[ -r /proc/net/netstat ]]; then
+        local listen_overflows listen_drops backlog_drops
+        listen_overflows="$(netstat_field /proc/net/netstat 'TcpExt:' ListenOverflows)"
+        listen_drops="$(netstat_field /proc/net/netstat 'TcpExt:' ListenDrops)"
+        backlog_drops="$(netstat_field /proc/net/netstat 'TcpExt:' TCPBacklogDrop)"
+        listen_overflows="${listen_overflows:-0}"
+        listen_drops="${listen_drops:-0}"
+        backlog_drops="${backlog_drops:-0}"
+        if ((listen_overflows > 0 || listen_drops > 0 || backlog_drops > 0)); then
+            FLAG_SYN_BACKLOG=1
+            status_line WARN "$(tr_text 'TCP 监听/积压队列存在累计丢弃' 'TCP listen/backlog queues have cumulative drops'): overflow=$listen_overflows listen_drop=$listen_drops backlog_drop=$backlog_drops"
+        else
+            status_line PASS "$(tr_text '未发现 TCP 监听/积压队列丢弃' 'No TCP listen/backlog queue drops found')"
+        fi
+    fi
+
+    if [[ -r /proc/net/softnet_stat ]]; then
+        local _processed_hex dropped_hex squeezed_hex _rest softnet_dropped=0 softnet_squeezed=0
+        while read -r _processed_hex dropped_hex squeezed_hex _rest; do
+            [[ "$dropped_hex" =~ ^[0-9A-Fa-f]+$ ]] && softnet_dropped=$((softnet_dropped + 16#$dropped_hex))
+            [[ "$squeezed_hex" =~ ^[0-9A-Fa-f]+$ ]] && softnet_squeezed=$((softnet_squeezed + 16#$squeezed_hex))
+        done < /proc/net/softnet_stat
+        if ((softnet_dropped > 0 || softnet_squeezed > 0)); then
+            FLAG_NETWORK_STACK=1
+            status_line WARN "$(tr_text '内核 softnet 存在累计丢包/处理挤压' 'Kernel softnet has cumulative drops/time-squeeze events'): dropped=$softnet_dropped squeezed=$softnet_squeezed"
+        else
+            status_line PASS "$(tr_text '内核 softnet 没有累计丢包' 'No cumulative kernel softnet drops')"
+        fi
+    fi
+
+    if command_exists ss; then
+        local state_summary syn_recv
+        state_summary="$(ss -Hant 2>/dev/null | awk '{count[$1]++} END {for (state in count) printf "%s=%d ", state, count[state]}' || true)"
+        syn_recv="$(ss -Hant state syn-recv 2>/dev/null | wc -l | tr -d ' ')"
+        append_block "$(tr_text 'TCP 状态摘要：' 'TCP state summary:')" "$state_summary"
+        if ((syn_recv >= 1000)); then
+            FLAG_SYN_BACKLOG=2
+            status_line FAIL "$(tr_text 'SYN-RECV 连接异常多，疑似连接洪泛或应用拥堵' 'Extremely high SYN-RECV count; possible flood or application congestion'): $syn_recv"
+        elif ((syn_recv >= 100)); then
+            FLAG_SYN_BACKLOG=1
+            status_line WARN "$(tr_text 'SYN-RECV 连接较多' 'Elevated SYN-RECV count'): $syn_recv"
+        else
+            status_line PASS "SYN-RECV: $syn_recv"
+        fi
+
+        local port listen_line
+        for port in "${PORTS[@]}"; do
+            listen_line="$(ss -H -lnt 2>/dev/null | awk -v suffix=":$port" '$4 ~ suffix "$" {print; exit}')"
+            if [[ -n "$listen_line" ]]; then
+                status_line PASS "$(tr_text '本机 TCP 端口正在监听' 'Local TCP port is listening'): $port"
+            else
+                FLAG_PORT_CHECK=1
+                status_line FAIL "$(tr_text '本机 TCP 端口未监听' 'Local TCP port is not listening'): $port"
+            fi
+        done
+    elif ((${#PORTS[@]} > 0)); then
+        status_line WARN "$(tr_text '缺少 ss，无法检查指定监听端口' 'ss is unavailable; requested listening-port checks were skipped')"
+    fi
+
+    if ((${#TCP_TARGETS[@]} > 0)); then
+        if command_exists timeout; then
+            local tcp_target host port
+            for tcp_target in "${TCP_TARGETS[@]}"; do
+                host="${tcp_target%:*}"
+                port="${tcp_target##*:}"
+                if timeout 5 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$host" "$port" 2>/dev/null; then
+                    status_line PASS "$(tr_text '远端 TCP 端口可连接' 'Remote TCP port is reachable'): $tcp_target"
+                else
+                    FLAG_TCP_TARGET=1
+                    status_line FAIL "$(tr_text '远端 TCP 端口连接失败' 'Remote TCP connection failed'): $tcp_target"
+                fi
+            done
+        else
+            status_line WARN "$(tr_text '缺少 timeout，无法安全执行远端 TCP 探测' 'timeout is unavailable; remote TCP probes were skipped safely')"
+        fi
+    fi
+}
+
 import_probe_log() {
     [[ -n "$PROBE_LOG" ]] || return 0
     section "$(tr_text '外部探针证据' 'External probe evidence')"
@@ -700,6 +1117,24 @@ import_probe_log() {
     append_block "$(tr_text '探针日志末尾（完整文件已进入证据包）：' 'Probe log tail (full file is in the evidence bundle):')" "$(tail -n 50 "$PROBE_LOG" 2>/dev/null || true)"
 }
 
+import_process_monitor_log() {
+    [[ -n "$MONITOR_LOG" ]] || return 0
+    section "$(tr_text '后台异常进程证据' 'Background process-monitor evidence')"
+
+    cp -- "$MONITOR_LOG" "$BUNDLE_DIR/raw/process-monitor.log"
+    MONITOR_ANOMALY_COUNT="$(grep -c '\[ANOMALY\]' "$MONITOR_LOG" 2>/dev/null || true)"
+    if ((MONITOR_ANOMALY_COUNT > 0)); then
+        FLAG_PROCESS_MONITOR=1
+        status_line WARN "$(tr_text '后台监控捕获到异常快照' 'Background monitor captured anomaly snapshots'): $MONITOR_ANOMALY_COUNT"
+        add_ticket_fact "The background process monitor captured ${MONITOR_ANOMALY_COUNT} anomaly snapshots."
+    elif ((MONITOR_LOG_AUTO == 1)); then
+        status_line PASS "$(tr_text '已自动导入后台监控日志，暂未发现异常快照' 'Automatically imported the monitor log; no anomaly snapshots were found')"
+    else
+        status_line PASS "$(tr_text '后台监控日志中没有异常快照' 'No anomaly snapshots were found in the monitor log')"
+    fi
+    append_block "$(tr_text '后台监控日志末尾（完整文件已进入证据包）：' 'Monitor log tail (full file is in the evidence bundle):')" "$(tail -n 80 "$MONITOR_LOG" 2>/dev/null || true)"
+}
+
 build_recommendations() {
     section "$(tr_text '建议与下一步' 'Recommendations and next steps')"
 
@@ -707,6 +1142,19 @@ build_recommendations() {
         add_recommendation \
             "系统负载高于可用 CPU。先查看 evidence/raw/processes.txt 和 top，判断是本机进程占用还是 CPU steal 同时偏高；只有排除本机负载后，才应把方向转向宿主机争用。" \
             "System load exceeds available CPU capacity. Review evidence/raw/processes.txt and top to distinguish guest workload from elevated CPU steal; investigate host contention only after guest load is ruled out."
+    fi
+
+    if ((FLAG_CPU_PRESSURE > 0 || FLAG_CGROUP_THROTTLE > 0)); then
+        add_recommendation \
+            "检测到 CPU PSI 压力或 cgroup 节流。先对照进程 Top 与 CPU 配额；如果业务负载不高但 PSI/节流持续出现，保存多次样本并要求厂商检查宿主机 CPU 争用或套餐限额。" \
+            "CPU PSI pressure or cgroup throttling was detected. Compare process activity with the CPU quota; if guest workload is low while pressure/throttling persists, preserve repeated samples and ask the provider to inspect host contention or plan limits."
+        add_ticket_fact "CPU pressure or cgroup throttling was detected during guest-side checks."
+    fi
+
+    if ((FLAG_MEMORY_PRESSURE > 0 || FLAG_IO_PRESSURE > 0)); then
+        add_recommendation \
+            "PSI 显示任务因内存或 I/O 持续等待。结合 resources.txt、D 状态进程和 cgroup 内存上限判断；本机没有重负载时，I/O full 压力可作为宿主机存储争用线索。" \
+            "PSI shows tasks stalled on memory or I/O. Correlate resources.txt, D-state tasks, and the cgroup memory limit; persistent I/O full pressure without guest load can indicate host storage contention."
     fi
 
     if ((CPU_STEAL_PCT >= 5)); then
@@ -742,16 +1190,71 @@ build_recommendations() {
         add_ticket_fact "The guest kernel log contains storage or filesystem I/O errors."
     fi
 
+    if ((FLAG_KERNEL_CRASH > 0)); then
+        add_recommendation \
+            "内核日志记录到进程崩溃、general protection fault 或硬件错误。先定位对应程序与时间；若出现 MCE/hardware error 或多个无关进程同时崩溃，应把原始内核日志提交厂商。" \
+            "Kernel logs contain process crashes, general-protection faults, or hardware errors. Identify the program and timestamp; MCE/hardware errors or crashes across unrelated processes should be escalated with raw kernel logs."
+    fi
+
+    if ((FLAG_TIMEKEEPING > 0)); then
+        add_recommendation \
+            "发现时钟源不稳定或时间跳变，可能影响 TLS、定时任务和探针时间线。确认 NTP 状态；虚拟机 clocksource 持续异常时要求厂商检查 hypervisor 时间同步。" \
+            "Clocksource instability or time jumps were found, which can affect TLS, scheduled jobs, and monitoring timelines. Verify NTP and ask the provider to inspect hypervisor timekeeping if it persists."
+    fi
+
     if ((FLAG_FAILED_UNITS > 0 || FLAG_SERVICE_DOWN > 0)); then
         add_recommendation \
             "存在失败或未运行的服务。先执行 systemctl status <服务名> 和 journalctl -u <服务名> --since \"${HOURS} hours ago\"，这类问题通常应先在 VPS 内部处理。" \
             "Failed or inactive services were found. Run systemctl status <unit> and journalctl -u <unit> --since \"${HOURS} hours ago\"; these issues usually need guest-side remediation first."
     fi
 
+    if ((FLAG_DSTATE > 0 || FLAG_ZOMBIE > 0)); then
+        add_recommendation \
+            "发现 D 状态或僵尸进程。D 状态通常需要检查磁盘/NFS/块设备等待，僵尸进程需要定位其父进程；后台监控日志可以确认它们是否反复出现。" \
+            "D-state or zombie processes were found. Investigate disk/NFS/block-device waits for D-state tasks and identify parent processes for zombies; the background monitor can confirm whether they recur."
+    fi
+
+    if ((FLAG_FILE_HANDLES > 0 || FLAG_PID_LIMIT > 0)); then
+        add_recommendation \
+            "系统文件句柄或 PID 配额接近上限，新进程或新连接可能随机失败。检查高句柄进程、进程风暴和 cgroup pids.max，再决定调整限制或修复程序。" \
+            "File handles or the PID quota are close to exhaustion, which can cause random process or connection failures. Find high-handle processes and process storms before changing limits."
+    fi
+
+    if ((FLAG_READONLY_ROOT > 0)); then
+        add_recommendation \
+            "根文件系统已变为只读。立即备份并检查内核 I/O/文件系统错误，优先联系厂商处理存储问题，不要强制写入或反复重启。" \
+            "The root filesystem is read-only. Back up data and inspect kernel I/O/filesystem errors; contact the provider about storage before forcing writes or repeatedly rebooting."
+        add_ticket_fact "The guest root filesystem was observed mounted read-only."
+    fi
+
+    if ((FLAG_RECENT_REBOOT > 0)); then
+        add_recommendation \
+            "系统在检查窗口内重启过。将 last -x、上一启动日志和外部探针时间对齐；若没有客户机重启命令或内核原因，要求厂商核查宿主机重启/迁移记录。" \
+            "The system rebooted within the review window. Correlate last -x, previous-boot logs, and external monitoring; if no guest-side cause exists, ask the provider for host reboot or migration records."
+    fi
+
     if ((FLAG_CONNTRACK > 0)); then
         add_recommendation \
             "连接跟踪表使用率偏高，检查 ss -s、连接洪泛、NAT/代理并发和防火墙规则；耗尽时会表现为新连接随机失败。" \
             "Conntrack usage is high. Inspect ss -s, connection floods, NAT/proxy concurrency, and firewall rules; table exhaustion can cause random new-connection failures."
+    fi
+
+    if ((FLAG_NETWORK_STACK > 0 || FLAG_TCP_RETRANS > 0 || FLAG_SYN_BACKLOG > 0)); then
+        add_recommendation \
+            "TCP 栈存在重传、监听队列溢出、SYN 堆积或内核网络告警。先检查是否遭受连接洪泛以及应用 accept 速度；若网卡增量也异常，再提交厂商检查节点网络。" \
+            "The TCP stack shows retransmissions, listen-queue overflow, SYN buildup, or kernel network warnings. Check connection floods and application accept performance; escalate to the provider if NIC deltas are also abnormal."
+    fi
+
+    if ((FLAG_PORT_CHECK > 0)); then
+        add_recommendation \
+            "指定的本机 TCP 端口没有监听。先检查对应服务状态、监听地址和启动日志，再检查防火墙；端口本身未监听时不应先归因于线路或厂商。" \
+            "A requested local TCP port is not listening. Check the service state, bind address, and startup logs before the firewall; a non-listening port is a guest-side issue before it is a provider/network issue."
+    fi
+
+    if ((FLAG_TCP_TARGET > 0)); then
+        add_recommendation \
+            "指定的远端 TCP 目标连接失败。结合 DNS、Ping、路由和目标服务状态判断；只有多个不同目标同时失败时，才更像本机出口或上游问题。" \
+            "A requested remote TCP target failed. Correlate DNS, Ping, routing, and the destination service; failures across multiple unrelated targets more strongly indicate guest egress or upstream trouble."
     fi
 
     if ((FLAG_NIC_EVENT > 0 || FLAG_NIC_COUNTER > 0)); then
@@ -787,10 +1290,16 @@ build_recommendations() {
         add_ticket_fact "Continuous monitoring captured ${WATCH_FAILURES} failed probes and ${WATCH_TRANSITIONS} state changes."
     fi
 
+    if ((FLAG_PROCESS_MONITOR > 0)); then
+        add_recommendation \
+            "后台监控捕获到 ${MONITOR_ANOMALY_COUNT} 个异常快照。按时间查看 process-monitor.log 中的 Top CPU/内存、D 状态、steal、iowait 和 PSI，并与探针 lost/back 时间对齐后再定责。" \
+            "The background monitor captured ${MONITOR_ANOMALY_COUNT} anomaly snapshots. Correlate Top CPU/memory, D-state, steal, iowait, and PSI in process-monitor.log with external lost/back timestamps before assigning cause."
+    fi
+
     if ((${#RECOMMENDATIONS_ZH[@]} == 0)); then
         add_recommendation \
-            "本次快照没有发现明确异常，但这不能排除间歇性故障。建议使用 --watch 持续记录，并从外部探针导出 lost/back 日志后用 --probe-log 重新生成证据包。" \
-            "No clear anomaly was found in this snapshot, but intermittent faults are not ruled out. Use --watch and rerun with --probe-log after exporting lost/back events from an external monitor."
+            "本次快照没有发现明确异常，但这不能排除间歇性进程或资源故障。如果你仍感觉 VPS 有问题，建议运行：sudo bash vps-health-monitor.sh start --interval 3 --cpu 70 --memory 40 --load 120 --cooldown 60 --max-log-mb 20，让后台自动抓取异常 Top 快照；网络问题同时使用 --watch 和外部探针。" \
+            "No clear anomaly was found in this snapshot, but intermittent process or resource faults are not ruled out. If the VPS still feels unhealthy, run: sudo bash vps-health-monitor.sh start --interval 3 --cpu 70 --memory 40 --load 120 --cooldown 60 --max-log-mb 20, and use --watch plus external monitoring for network issues."
     fi
 
     add_recommendation \
@@ -837,7 +1346,32 @@ collect_raw_evidence() {
         fi
         printf '\n-- top processes (arguments excluded) --\n'
         ps -eo pid,ppid,user,%cpu,%mem,stat,comm --sort=-%cpu 2>/dev/null | head -n 30 || true
+        printf '\n-- top memory processes (arguments excluded) --\n'
+        ps -eo pid,ppid,user,%cpu,%mem,rss,stat,comm --sort=-%mem 2>/dev/null | head -n 30 || true
     } >"$BUNDLE_DIR/raw/resources.txt"
+
+    {
+        printf '%s\n' '-- pressure stall information --'
+        for pressure_file in /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io; do
+            [[ -r "$pressure_file" ]] || continue
+            printf '[%s]\n' "$(basename -- "$pressure_file")"
+            cat "$pressure_file"
+        done
+        printf '\n%s\n' '-- cgroup v2 limits --'
+        for cgroup_file in cpu.max cpu.stat memory.current memory.max memory.events pids.current pids.max; do
+            [[ -r "/sys/fs/cgroup/$cgroup_file" ]] || continue
+            printf '[%s]\n' "$cgroup_file"
+            cat "/sys/fs/cgroup/$cgroup_file"
+        done
+        printf '\n%s\n' '-- file handles --'
+        [[ -r /proc/sys/fs/file-nr ]] && cat /proc/sys/fs/file-nr
+        printf '\n%s\n' '-- process states --'
+        ps -eo pid,ppid,user,stat,etimes,%cpu,%mem,rss,comm 2>/dev/null | awk 'NR == 1 || $4 ~ /^[DZ]/' || true
+        printf '\n%s\n' '-- mounts --'
+        if command_exists findmnt; then
+            findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null || true
+        fi
+    } >"$BUNDLE_DIR/raw/pressure-and-limits.txt"
 
     {
         if command_exists ip; then
@@ -854,7 +1388,19 @@ collect_raw_evidence() {
         printf '\n-- socket summary --\n'
         if command_exists ss; then
             ss -s 2>/dev/null || true
+            printf '\n-- TCP states --\n'
+            ss -Hant 2>/dev/null | awk '{count[$1]++} END {for (state in count) print state, count[state]}' || true
+            printf '\n-- listening TCP/UDP sockets --\n'
+            ss -H -lntu 2>/dev/null || true
         fi
+        printf '\n-- /proc/net/snmp --\n'
+        [[ -r /proc/net/snmp ]] && cat /proc/net/snmp
+        printf '\n-- /proc/net/netstat --\n'
+        [[ -r /proc/net/netstat ]] && cat /proc/net/netstat
+        printf '\n-- /proc/net/softnet_stat --\n'
+        [[ -r /proc/net/softnet_stat ]] && cat /proc/net/softnet_stat
+        printf '\n-- resolver --\n'
+        [[ -r /etc/resolv.conf ]] && cat /etc/resolv.conf
     } >"$BUNDLE_DIR/raw/network.txt"
 
     {
@@ -867,6 +1413,10 @@ collect_raw_evidence() {
             done
         fi
     } >"$BUNDLE_DIR/raw/services.txt"
+
+    if command_exists journalctl; then
+        journalctl -b -1 -p warning..alert --no-pager 2>/dev/null >"$BUNDLE_DIR/raw/previous-boot-warnings.txt" || true
+    fi
 }
 
 write_summary_markdown() {
@@ -881,7 +1431,13 @@ write_summary_markdown() {
         printf -- '- Checks: PASS=%d, WARN=%d, FAIL=%d\n' "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
         printf -- '- CPU steal sample: %s%%\n' "$CPU_STEAL_PCT"
         printf -- '- CPU I/O wait sample: %s%%\n' "$CPU_IOWAIT_PCT"
-        printf -- '- External lost events imported: %s\n\n' "$PROBE_LOST_COUNT"
+        printf -- '- CPU PSI some avg10: %s%%\n' "${PSI_CPU_AVG10:-unavailable}"
+        printf -- '- Memory PSI full avg10: %s%%\n' "${PSI_MEMORY_FULL_AVG10:-unavailable}"
+        printf -- '- I/O PSI full avg10: %s%%\n' "${PSI_IO_FULL_AVG10:-unavailable}"
+        printf -- '- cgroup throttled-period sample: %s%%\n' "$CGROUP_THROTTLE_PCT"
+        printf -- '- TCP lifetime retransmission ratio: %s%%\n' "$TCP_RETRANS_PCT"
+        printf -- '- External lost events imported: %s\n' "$PROBE_LOST_COUNT"
+        printf -- '- Background anomaly snapshots imported: %s\n\n' "$MONITOR_ANOMALY_COUNT"
         printf '## Recommendations (Chinese)\n\n'
         for ((i = 0; i < ${#RECOMMENDATIONS_ZH[@]}; i++)); do
             printf '%d. %s\n' "$((i + 1))" "${RECOMMENDATIONS_ZH[$i]}"
@@ -927,9 +1483,10 @@ write_review_prompt() {
 1. VPS 内部资源或服务问题；
 2. 宿主机 CPU/存储争用或疑似超售；
 3. 虚拟网卡、上游路由、DDoS 清洗或线路问题；
-4. 当前证据不足。
+4. 短时异常进程、cgroup 限额、PSI 压力或 TCP 栈拥堵；
+5. 当前证据不足。
 
-请先阅读 summary.md 和 report.txt，再核对 raw/ 下的原始证据。请按“已确认事实、合理推断、仍缺证据”三层输出，不要仅凭单次 CPU steal、单个 MTR 中间跳丢包或一次 Ping 失败就断定厂商责任。最后列出需要补采的命令、应提交厂商的问题，以及是否建议迁移节点。
+请先阅读 summary.md 和 report.txt，再核对 raw/ 下的原始证据；如果存在 process-monitor.log，请把异常快照与外部探针时间线对齐。请按“已确认事实、合理推断、仍缺证据”三层输出，不要仅凭单次 CPU steal、单个 MTR 中间跳丢包或一次 Ping 失败就断定厂商责任。最后列出需要补采的命令、应提交厂商的问题，以及是否建议迁移节点。
 
 注意：不要要求用户提供密码、私钥、API Key 或其他秘密。
 EOF
@@ -1029,11 +1586,14 @@ plain_log "Command: $0"
 kernel_log="$(collect_kernel_log)"
 check_system
 check_resources
+check_pressure_and_limits
 check_services_and_reboots
 check_kernel_events "$kernel_log"
 check_network_interface
 check_connectivity
+check_network_stack_and_ports
 import_probe_log
+import_process_monitor_log
 watch_network
 build_recommendations
 print_summary
