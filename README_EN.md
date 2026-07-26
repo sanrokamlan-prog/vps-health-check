@@ -9,7 +9,7 @@ It checks guest resources, OOM events, PSI pressure, cgroup quotas/throttling, p
 ## Quick start
 
 ```bash
-curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.2.0/vps-health-check.sh -o /tmp/vps-health-check.sh && sudo bash /tmp/vps-health-check.sh
+curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.3.0/vps-health-check.sh -o /tmp/vps-health-check.sh && sudo bash /tmp/vps-health-check.sh
 ```
 
 Useful examples:
@@ -39,7 +39,7 @@ sudo bash /tmp/vps-health-check.sh --lang en
 One-off checks can miss brief CPU spikes, D-state stalls, pressure events, or runaway processes. The companion monitor writes a snapshot only when thresholds are exceeded and can run unattended in the background:
 
 ```bash
-curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.2.0/vps-health-monitor.sh -o /tmp/vps-health-monitor.sh
+curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.3.0/vps-health-monitor.sh -o /tmp/vps-health-monitor.sh
 
 sudo bash /tmp/vps-health-monitor.sh start \
   --interval 3 --cpu 70 --memory 40 --load 120 \

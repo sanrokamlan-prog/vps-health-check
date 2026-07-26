@@ -41,7 +41,7 @@ MTR / 持续监测 ───┘                         └─> 管理员 / AI �
 
 | 项目 | 当前能力 |
 | --- | --- |
-| 当前版本 | `v1.2.0` |
+| 当前版本 | `v1.3.0` |
 | 运行方式 | 单文件 Bash 脚本，下载即用 |
 | 默认语言 | 中文，支持 `--lang en` |
 | 操作边界 | 只读，不改防火墙、不重启服务、不安装软件 |
@@ -56,7 +56,7 @@ MTR / 持续监测 ───┘                         └─> 管理员 / AI �
 下载稳定版并立即检查：
 
 ```bash
-curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.2.0/vps-health-check.sh -o /tmp/vps-health-check.sh && sudo bash /tmp/vps-health-check.sh
+curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.3.0/vps-health-check.sh -o /tmp/vps-health-check.sh && sudo bash /tmp/vps-health-check.sh
 ```
 
 检查结束后，终端会给出报告与证据包路径：
@@ -87,7 +87,7 @@ curl -fsSL https://raw.githubusercontent.com/sanrokamlan-prog/vps-health-check/m
 下面是脚本发现宿主机争用线索与外部中断记录时的典型输出结构：
 
 ```text
-VPS Health Check v1.2.0
+VPS Health Check v1.3.0
 
 == 资源状态 ==
 [PASS] 内存使用率: 41%
@@ -201,7 +201,7 @@ sudo bash /tmp/vps-health-check.sh --watch 3600 --interval 5
 一次性检查没有异常、但 VPS 持有者仍感觉卡顿、断流或偶发失联时，使用后台监控比人工蹲守更可靠：
 
 ```bash
-curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.2.0/vps-health-monitor.sh -o /tmp/vps-health-monitor.sh
+curl -fsSL https://github.com/sanrokamlan-prog/vps-health-check/releases/download/v1.3.0/vps-health-monitor.sh -o /tmp/vps-health-monitor.sh
 
 sudo bash /tmp/vps-health-monitor.sh start \
   --interval 3 \

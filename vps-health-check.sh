@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 PROJECT_URL="https://github.com/sanrokamlan-prog/vps-health-check"
 HOURS=24
 INTERVAL=5

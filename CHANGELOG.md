@@ -2,7 +2,7 @@
 
 All notable changes are documented in this file.
 
-## Unreleased
+## 1.3.0 - 2026-07-26
 
 - Added repeatable `--http` endpoint checks with HTTP status, DNS/connect/TLS/first-byte/total timings, redirect destination, remote address, and HTTPS certificate-expiry diagnostics.
 - Added repeatable `--dns` business-hostname checks with resolution timing and resolved-address evidence.

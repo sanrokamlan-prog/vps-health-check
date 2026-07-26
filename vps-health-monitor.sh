@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 COMMAND="${1:-help}"
 [[ $# -gt 0 ]] && shift
 if [[ "$COMMAND" == "-h" || "$COMMAND" == "--help" ]]; then
