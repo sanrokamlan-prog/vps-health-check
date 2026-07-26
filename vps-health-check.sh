@@ -101,6 +101,7 @@ HTTPS_OK=-1
 IPV6_OK=-1
 PROBE_LOST_COUNT=0
 MONITOR_ANOMALY_COUNT=0
+MONITOR_NETWORK_DOWN_COUNT=0
 FLAG_PROCESS_MONITOR=0
 WATCH_FAILURES=0
 WATCH_TRANSITIONS=0
@@ -1438,18 +1439,22 @@ import_probe_log() {
 
 import_process_monitor_log() {
     [[ -n "$MONITOR_LOG" ]] || return 0
-    section "$(tr_text '后台异常进程证据' 'Background process-monitor evidence')"
+    section "$(tr_text '后台资源与网络监控证据' 'Background resource and network-monitor evidence')"
 
     cp -- "$MONITOR_LOG" "$BUNDLE_DIR/raw/process-monitor.log"
-    MONITOR_ANOMALY_COUNT="$(grep -c '\[ANOMALY\]' "$MONITOR_LOG" 2>/dev/null || true)"
+    MONITOR_ANOMALY_COUNT="$(grep -Ec '\[(ANOMALY|NETWORK-ANOMALY)\]' "$MONITOR_LOG" 2>/dev/null || true)"
+    MONITOR_NETWORK_DOWN_COUNT="$(grep -c 'scope=network state=DOWN' "$MONITOR_LOG" 2>/dev/null || true)"
     if ((MONITOR_ANOMALY_COUNT > 0)); then
         FLAG_PROCESS_MONITOR=1
-        status_line WARN "$(tr_text '后台监控捕获到异常快照' 'Background monitor captured anomaly snapshots'): $MONITOR_ANOMALY_COUNT"
-        add_ticket_fact "The background process monitor captured ${MONITOR_ANOMALY_COUNT} anomaly snapshots."
+        status_line WARN "$(tr_text '后台监控捕获到资源或网络异常快照' 'Background monitor captured resource or network anomaly snapshots'): $MONITOR_ANOMALY_COUNT"
+        add_ticket_fact "The background monitor captured ${MONITOR_ANOMALY_COUNT} resource or network anomaly snapshots."
     elif ((MONITOR_LOG_AUTO == 1)); then
         status_line PASS "$(tr_text '已自动导入后台监控日志，暂未发现异常快照' 'Automatically imported the monitor log; no anomaly snapshots were found')"
     else
         status_line PASS "$(tr_text '后台监控日志中没有异常快照' 'No anomaly snapshots were found in the monitor log')"
+    fi
+    if ((MONITOR_NETWORK_DOWN_COUNT > 0)); then
+        add_ticket_fact "The background monitor recorded ${MONITOR_NETWORK_DOWN_COUNT} network DOWN transitions."
     fi
     append_block "$(tr_text '后台监控日志末尾（完整文件已进入证据包）：' 'Monitor log tail (full file is in the evidence bundle):')" "$(tail -n 80 "$MONITOR_LOG" 2>/dev/null || true)"
 }
@@ -1633,8 +1638,8 @@ build_timeline_recommendations() {
 
     if ((FLAG_PROCESS_MONITOR > 0)); then
         add_recommendation \
-            "后台监控捕获到 ${MONITOR_ANOMALY_COUNT} 个异常快照。按时间查看 process-monitor.log 中的 Top CPU/内存、D 状态、steal、iowait 和 PSI，并与探针 lost/back 时间对齐后再定责。" \
-            "The background monitor captured ${MONITOR_ANOMALY_COUNT} anomaly snapshots. Correlate Top CPU/memory, D-state, steal, iowait, and PSI in process-monitor.log with external lost/back timestamps before assigning cause."
+            "后台监控捕获到 ${MONITOR_ANOMALY_COUNT} 个资源或网络异常快照。按时间查看 process-monitor.log 中的 Top 进程、压力指标、路由、网卡计数、TCP 状态与 DOWN/UP 事件，并与外部探针时间对齐后再定责。" \
+            "The background monitor captured ${MONITOR_ANOMALY_COUNT} resource or network anomaly snapshots. Correlate processes, pressure, routes, NIC counters, TCP state, and DOWN/UP events in process-monitor.log with external probe timestamps before assigning cause."
     fi
 }
 

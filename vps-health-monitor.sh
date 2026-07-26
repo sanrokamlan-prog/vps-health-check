@@ -19,7 +19,12 @@ MEMORY_THRESHOLD=50
 LOAD_THRESHOLD=150
 COOLDOWN=60
 MAX_LOG_MB=10
+NETWORK_FAILURE_THRESHOLD=2
 STOP_REQUESTED=0
+TARGETS=("1.1.1.1" "8.8.8.8")
+TARGETS_OVERRIDDEN=0
+NETWORK_DOWN_COUNT=0
+NETWORK_STATE="UNKNOWN"
 
 if ((EUID == 0)); then
     STATE_DIR="/var/log/vps-health-monitor"
@@ -33,6 +38,8 @@ SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "
 SCRIPT_BASENAME="$(basename -- "$SCRIPT_PATH")"
 
 declare -A LAST_ALERT=()
+declare -A TARGET_STATE=()
+declare -A TARGET_FAILURE_STREAK=()
 
 usage() {
     cat <<'EOF'
@@ -58,6 +65,8 @@ VPS Health Monitor - 后台异常进程与资源压力记录器
   --load N          系统 Load/CPU 告警阈值百分比（默认：150）
   --cooldown N      同类异常抓取冷却秒数（默认：60）
   --max-log-mb N    日志轮转大小 MiB（默认：10，仅保留 .1）
+  --target HOST      后台网络探测目标，可重复使用（默认：1.1.1.1、8.8.8.8）
+  --network-failures N 连续失败 N 次后记录 DOWN（默认：2）
   --log FILE        自定义日志文件
   --pid-file FILE   自定义 PID 文件
   -h, --help        显示帮助
@@ -65,6 +74,7 @@ VPS Health Monitor - 后台异常进程与资源压力记录器
 示例：
   sudo bash vps-health-monitor.sh start
   sudo bash vps-health-monitor.sh start --interval 3 --cpu 70 --max-log-mb 20
+  sudo bash vps-health-monitor.sh start --target 1.1.1.1 --target 8.8.8.8 --network-failures 2
   sudo bash vps-health-monitor.sh status
   sudo bash vps-health-monitor.sh stop
 EOF
@@ -111,6 +121,20 @@ while (($# > 0)); do
             MAX_LOG_MB="$2"
             shift 2
             ;;
+        --target)
+            [[ $# -ge 2 ]] || { echo "--target requires a value" >&2; exit 2; }
+            if ((TARGETS_OVERRIDDEN == 0)); then
+                TARGETS=()
+                TARGETS_OVERRIDDEN=1
+            fi
+            TARGETS+=("$2")
+            shift 2
+            ;;
+        --network-failures)
+            [[ $# -ge 2 ]] || { echo "--network-failures requires a value" >&2; exit 2; }
+            NETWORK_FAILURE_THRESHOLD="$2"
+            shift 2
+            ;;
         --log)
             [[ $# -ge 2 ]] || { echo "--log requires a value" >&2; exit 2; }
             LOG_FILE="$2"
@@ -133,11 +157,18 @@ while (($# > 0)); do
     esac
 done
 
-for numeric in "$INTERVAL" "$DURATION" "$CPU_THRESHOLD" "$MEMORY_THRESHOLD" "$LOAD_THRESHOLD" "$COOLDOWN" "$MAX_LOG_MB"; do
+for numeric in "$INTERVAL" "$DURATION" "$CPU_THRESHOLD" "$MEMORY_THRESHOLD" "$LOAD_THRESHOLD" "$COOLDOWN" "$MAX_LOG_MB" "$NETWORK_FAILURE_THRESHOLD"; do
     is_uint "$numeric" || { echo "Monitor options must be non-negative integers" >&2; exit 2; }
 done
 ((INTERVAL >= 1)) || { echo "--interval must be at least 1" >&2; exit 2; }
 ((MAX_LOG_MB >= 1)) || { echo "--max-log-mb must be at least 1" >&2; exit 2; }
+((NETWORK_FAILURE_THRESHOLD >= 1)) || { echo "--network-failures must be at least 1" >&2; exit 2; }
+for target in "${TARGETS[@]}"; do
+    if [[ ! "$target" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; then
+        echo "--target must use a valid IP address or hostname: $target" >&2
+        exit 2
+    fi
+done
 
 if [[ "$COMMAND" != "help" ]]; then
     mkdir -p -- "$(dirname -- "$LOG_FILE")" "$(dirname -- "$PID_FILE")" || {
@@ -257,6 +288,132 @@ capture_snapshot() {
     } >>"$LOG_FILE"
 }
 
+default_interface() {
+    command_exists ip || return 0
+    ip route show default 2>/dev/null | awk 'NR == 1 {for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+}
+
+interface_bytes() {
+    local iface="$1" rx=0 tx=0
+    [[ -n "$iface" && -r "/sys/class/net/$iface/statistics/rx_bytes" ]] || {
+        printf '0 0'
+        return
+    }
+    rx="$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || printf '0')"
+    tx="$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || printf '0')"
+    printf '%s %s' "$rx" "$tx"
+}
+
+capture_network_snapshot() {
+    local level="$1" reason="$2" iface route_target
+    local -a route_command
+    iface="$(default_interface)"
+    rotate_log_if_needed
+    {
+        printf '[%s] [%s] %s\n' "$(date '+%F %T %z')" "$level" "$reason"
+        printf '%s\n' '----- NETWORK SNAPSHOT BEGIN -----'
+        if command_exists ip; then
+            printf '%s\n' '-- addresses --'
+            ip -brief address show 2>/dev/null || true
+            printf '%s\n' '-- IPv4 routes --'
+            ip route show table all 2>/dev/null || true
+            printf '%s\n' '-- IPv6 routes --'
+            ip -6 route show table all 2>/dev/null || true
+            printf '%s\n' '-- target routes --'
+            for route_target in "${TARGETS[@]}"; do
+                route_command=(-4)
+                [[ "$route_target" == *:* ]] && route_command=(-6)
+                printf '[%s]\n' "$route_target"
+                ip "${route_command[@]}" route get "$route_target" 2>/dev/null || true
+            done
+            printf '%s\n' '-- link counters --'
+            ip -s link show 2>/dev/null || true
+        fi
+        if command_exists ss; then
+            printf '%s\n' '-- socket summary --'
+            ss -s 2>/dev/null || true
+            printf '%s\n' '-- TCP states --'
+            ss -Hant 2>/dev/null | awk '{count[$1]++} END {for (state in count) print state, count[state]}' || true
+        fi
+        printf '%s\n' '-- conntrack --'
+        [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]] && cat /proc/sys/net/netfilter/nf_conntrack_count
+        [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]] && cat /proc/sys/net/netfilter/nf_conntrack_max
+        if command_exists tc && [[ -n "$iface" ]]; then
+            printf '%s\n' '-- qdisc --'
+            tc -s qdisc show dev "$iface" 2>/dev/null || true
+        fi
+        if command_exists resolvectl; then
+            printf '%s\n' '-- resolver status --'
+            resolvectl status 2>/dev/null || true
+        else
+            printf '%s\n' '-- resolv.conf --'
+            [[ -r /etc/resolv.conf ]] && cat /etc/resolv.conf
+        fi
+        if command_exists journalctl; then
+            printf '%s\n' '-- recent kernel warnings --'
+            journalctl -k -p warning..alert -n 40 --no-pager 2>/dev/null || true
+        fi
+        printf '%s\n' '----- NETWORK SNAPSHOT END -----'
+    } >>"$LOG_FILE"
+}
+
+ping_probe() {
+    local target="$1" output rtt
+    output="$(ping -n -c 1 -W 1 "$target" 2>&1)" || return 1
+    rtt="$(printf '%s\n' "$output" | sed -nE 's/.*time[=<]([0-9]+([.][0-9]+)?).*/\1/p' | tail -n 1)"
+    printf '%s' "${rtt:-unknown}"
+}
+
+monitor_network_targets() {
+    command_exists ping || return 0
+    local target state failures rtt new_network_state total_targets
+    NETWORK_DOWN_COUNT=0
+    total_targets=${#TARGETS[@]}
+    for target in "${TARGETS[@]}"; do
+        state="${TARGET_STATE[$target]:-UNKNOWN}"
+        failures="${TARGET_FAILURE_STREAK[$target]:-0}"
+        if rtt="$(ping_probe "$target")"; then
+            TARGET_FAILURE_STREAK["$target"]=0
+            if [[ "$state" == "DOWN" ]]; then
+                TARGET_STATE["$target"]="UP"
+                log_line EVENT "scope=target target=$target state=UP previous=DOWN rtt_ms=$rtt"
+            elif [[ "$state" == "UNKNOWN" ]]; then
+                TARGET_STATE["$target"]="UP"
+                log_line NETWORK "target=$target state=UP initial=1 rtt_ms=$rtt"
+            fi
+        else
+            failures=$((failures + 1))
+            TARGET_FAILURE_STREAK["$target"]="$failures"
+            if ((failures >= NETWORK_FAILURE_THRESHOLD)); then
+                ((NETWORK_DOWN_COUNT += 1))
+                if [[ "$state" != "DOWN" ]]; then
+                    TARGET_STATE["$target"]="DOWN"
+                    log_line EVENT "scope=target target=$target state=DOWN consecutive_failures=$failures"
+                fi
+            elif [[ "$state" == "UP" ]]; then
+                log_line NETWORK "target=$target state=SUSPECT consecutive_failures=$failures"
+            fi
+        fi
+    done
+
+    if ((NETWORK_DOWN_COUNT == total_targets)); then
+        new_network_state="DOWN"
+    elif ((NETWORK_DOWN_COUNT > 0)); then
+        new_network_state="DEGRADED"
+    else
+        new_network_state="UP"
+    fi
+    if [[ "$new_network_state" != "$NETWORK_STATE" ]]; then
+        log_line EVENT "scope=network state=$new_network_state previous=$NETWORK_STATE down_targets=$NETWORK_DOWN_COUNT total_targets=$total_targets"
+        if [[ "$new_network_state" == "DOWN" ]]; then
+            capture_network_snapshot NETWORK-ANOMALY "all configured targets are unreachable"
+        elif [[ "$NETWORK_STATE" == "DOWN" ]]; then
+            capture_network_snapshot NETWORK-RECOVERY "network recovered to $new_network_state"
+        fi
+        NETWORK_STATE="$new_network_state"
+    fi
+}
+
 read_cpu_sample() {
     local _cpu user nice system idle iowait irq softirq steal _guest _guest_nice
     read -r _cpu user nice system idle iowait irq softirq steal _guest _guest_nice < /proc/stat
@@ -269,10 +426,15 @@ monitor_loop() {
     local busy_pct=0 steal_pct=0 iowait_pct=0 load1 cpus load_pct mem_total mem_available mem_pct
     local psi_cpu=0 psi_mem=0 psi_io=0 d_count=0 z_count=0 reasons="" process_reasons=""
     local pid _ppid user stat etimes cpu mem rss comm cpu_integer mem_integer
+    local iface rx_before tx_before rx_after tx_after rx_rate=0 tx_rate=0 targets_csv
 
     printf '%s\n' "$$" >"$PID_FILE"
     start="$(date +%s)"
-    log_line START "VPS Health Monitor v$VERSION pid=$$ interval=${INTERVAL}s duration=${DURATION}s cpu=${CPU_THRESHOLD}% memory=${MEMORY_THRESHOLD}% load=${LOAD_THRESHOLD}%"
+    targets_csv="$(IFS=,; printf '%s' "${TARGETS[*]}")"
+    log_line START "VPS Health Monitor v$VERSION pid=$$ interval=${INTERVAL}s duration=${DURATION}s cpu=${CPU_THRESHOLD}% memory=${MEMORY_THRESHOLD}% load=${LOAD_THRESHOLD}% targets=$targets_csv network_failures=$NETWORK_FAILURE_THRESHOLD"
+    if ! command_exists ping; then
+        log_line WARN "ping is unavailable; background network monitoring is disabled"
+    fi
 
     while ((STOP_REQUESTED == 0)); do
         now="$(date +%s)"
@@ -282,9 +444,19 @@ monitor_loop() {
 
         cpu_before="$(read_cpu_sample)"
         read -r total_1 idle_1 iowait_1 steal_1 <<<"$cpu_before"
+        iface="$(default_interface)"
+        read -r rx_before tx_before <<<"$(interface_bytes "$iface")"
         sleep "$INTERVAL"
         cpu_after="$(read_cpu_sample)"
         read -r total_2 idle_2 iowait_2 steal_2 <<<"$cpu_after"
+        read -r rx_after tx_after <<<"$(interface_bytes "$iface")"
+        if ((rx_after >= rx_before && tx_after >= tx_before)); then
+            rx_rate=$(((rx_after - rx_before) / INTERVAL))
+            tx_rate=$(((tx_after - tx_before) / INTERVAL))
+        else
+            rx_rate=0
+            tx_rate=0
+        fi
         delta_total=$((total_2 - total_1))
         if ((delta_total > 0)); then
             busy_pct=$(((delta_total - (idle_2 - idle_1) - (iowait_2 - iowait_1)) * 100 / delta_total))
@@ -341,8 +513,10 @@ monitor_loop() {
             capture_snapshot "process threshold exceeded:$process_reasons"
         fi
 
+        monitor_network_targets
+
         if ((now - last_heartbeat >= 300)); then
-            log_line HEARTBEAT "load=${load_pct}% busy=${busy_pct}% memory=${mem_pct}% steal=${steal_pct}% iowait=${iowait_pct}% psi_cpu=${psi_cpu}% psi_mem_full=${psi_mem}% psi_io_full=${psi_io}%"
+            log_line HEARTBEAT "load=${load_pct}% busy=${busy_pct}% memory=${mem_pct}% steal=${steal_pct}% iowait=${iowait_pct}% psi_cpu=${psi_cpu}% psi_mem_full=${psi_mem}% psi_io_full=${psi_io}% iface=${iface:-none} rx_Bps=$rx_rate tx_Bps=$tx_rate network_down=$NETWORK_DOWN_COUNT"
             last_heartbeat=$now
         fi
     done
@@ -364,6 +538,10 @@ case "$COMMAND" in
             echo "Log: $LOG_FILE"
             exit 1
         fi
+        target_args=()
+        for target in "${TARGETS[@]}"; do
+            target_args+=(--target "$target")
+        done
         # The child and nohup diagnostics intentionally append to one log; neither reads it.
         # shellcheck disable=SC2094
         nohup bash "$SCRIPT_PATH" run \
@@ -372,10 +550,12 @@ case "$COMMAND" in
             --cpu "$CPU_THRESHOLD" \
             --memory "$MEMORY_THRESHOLD" \
             --load "$LOAD_THRESHOLD" \
+            --network-failures "$NETWORK_FAILURE_THRESHOLD" \
             --cooldown "$COOLDOWN" \
             --max-log-mb "$MAX_LOG_MB" \
             --log "$LOG_FILE" \
             --pid-file "$PID_FILE" \
+            "${target_args[@]}" \
             >>"$LOG_FILE" 2>&1 &
         child_pid=$!
         sleep 1

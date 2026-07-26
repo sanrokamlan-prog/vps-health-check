@@ -212,7 +212,18 @@ sudo bash /tmp/vps-health-monitor.sh start \
   --max-log-mb 20
 ```
 
-监控器默认持续运行，只有异常时才会抓取快照。它记录 Top CPU/内存进程、D/Z 状态、Load、steal、iowait、PSI、`vmstat`、连接摘要和内核警告；不记录完整命令参数，避免敏感信息进入日志。
+监控器默认持续运行，只有异常时才会抓取快照。它记录 Top CPU/内存进程、D/Z 状态、Load、steal、iowait、PSI、`vmstat`、接口 RX/TX 速率和连接摘要；同时后台探测 `1.1.1.1` 与 `8.8.8.8`。单个目标失败只记录目标事件，所有目标连续失败 2 次才记录整网 `DOWN` 并抓取路由、网卡计数、TCP 状态、conntrack、qdisc、解析器和内核告警，恢复后再抓取恢复快照。
+
+可调整目标与确认次数：
+
+```bash
+sudo bash /tmp/vps-health-monitor.sh start \
+  --target 1.1.1.1 \
+  --target 8.8.8.8 \
+  --network-failures 3
+```
+
+监控日志不记录完整进程命令参数；`--target` 只接受 IP 或主机名，避免敏感参数进入日志。
 
 ```bash
 # 查看状态与日志

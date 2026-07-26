@@ -17,6 +17,8 @@ help_output="$(bash "$SCRIPT" --help)"
 [[ "$help_output" == *"--dns DOMAIN"* ]]
 monitor_help="$(bash "$ROOT_DIR/vps-health-monitor.sh" --help)"
 [[ "$monitor_help" == *"start             后台启动监控"* ]]
+[[ "$monitor_help" == *"--network-failures N"* ]]
+[[ "$monitor_help" == *"--target HOST"* ]]
 
 set +e
 bash "$SCRIPT" --hours invalid >/dev/null 2>&1
@@ -96,7 +98,7 @@ monitor_dir="$TEST_DIR/monitor"
 mkdir -p "$monitor_dir"
 monitor_log="$monitor_dir/monitor.log"
 monitor_pid="$monitor_dir/monitor.pid"
-bash "$ROOT_DIR/vps-health-monitor.sh" run --duration 2 --interval 1 --load 0 --cooldown 0 --log "$monitor_log" --pid-file "$monitor_pid" >"$monitor_dir/stdout.txt" 2>"$monitor_dir/stderr.txt"
+bash "$ROOT_DIR/vps-health-monitor.sh" run --duration 2 --interval 1 --load 0 --cooldown 0 --target 127.0.0.1 --network-failures 1 --log "$monitor_log" --pid-file "$monitor_pid" >"$monitor_dir/stdout.txt" 2>"$monitor_dir/stderr.txt"
 [[ -s "$monitor_log" ]]
 [[ ! -s "$monitor_dir/stderr.txt" ]]
 [[ ! -e "$monitor_pid" ]]
@@ -104,12 +106,24 @@ grep -q '\[START\]' "$monitor_log"
 grep -q '\[ANOMALY\]' "$monitor_log"
 grep -q 'SNAPSHOT BEGIN' "$monitor_log"
 grep -q '\[STOP\]' "$monitor_log"
+if [[ "$(uname -s)" == Linux* ]] && command -v ping >/dev/null 2>&1; then
+    grep -q '\[NETWORK\] target=127.0.0.1 state=UP' "$monitor_log"
+fi
+
+if [[ "$(uname -s)" == Linux* ]] && command -v ping >/dev/null 2>&1; then
+    network_log="$monitor_dir/network-down.log"
+    network_pid="$monitor_dir/network-down.pid"
+    bash "$ROOT_DIR/vps-health-monitor.sh" run --duration 2 --interval 1 --load 99999 --target 192.0.2.1 --network-failures 1 --log "$network_log" --pid-file "$network_pid" >"$monitor_dir/network-down.out" 2>"$monitor_dir/network-down.err"
+    grep -q 'state=DOWN' "$network_log"
+    grep -q '\[NETWORK-ANOMALY\]' "$network_log"
+    grep -q 'NETWORK SNAPSHOT BEGIN' "$network_log"
+fi
 
 renamed_monitor="$monitor_dir/renamed-monitor.sh"
 renamed_log="$monitor_dir/renamed.log"
 renamed_pid="$monitor_dir/renamed.pid"
 cp "$ROOT_DIR/vps-health-monitor.sh" "$renamed_monitor"
-bash "$renamed_monitor" start --duration 30 --interval 1 --load 0 --cooldown 60 --log "$renamed_log" --pid-file "$renamed_pid" >"$monitor_dir/start.txt"
+bash "$renamed_monitor" start --duration 30 --interval 1 --load 0 --cooldown 60 --target 127.0.0.1 --network-failures 1 --log "$renamed_log" --pid-file "$renamed_pid" >"$monitor_dir/start.txt"
 grep -q 'started: PID' "$monitor_dir/start.txt"
 bash "$renamed_monitor" status --log "$renamed_log" --pid-file "$renamed_pid" >"$monitor_dir/status.txt"
 grep -q 'running: PID' "$monitor_dir/status.txt"
@@ -126,7 +140,7 @@ set -e
 [[ ! -s "$TEST_DIR/monitor-import.err" ]]
 monitor_bundle="${monitor_report%.*}-evidence"
 [[ -s "$monitor_bundle/raw/process-monitor.log" ]]
-grep -q 'background process monitor captured' "$monitor_bundle/provider-ticket-en.txt"
+grep -q 'background monitor captured' "$monitor_bundle/provider-ticket-en.txt"
 
 watch_report="$TEST_DIR/watch.log"
 set +e

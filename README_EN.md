@@ -49,7 +49,17 @@ sudo bash /tmp/vps-health-monitor.sh status
 sudo bash /tmp/vps-health-monitor.sh stop
 ```
 
-When an anomaly occurs, it records Top CPU/memory processes without full command arguments, D/Z state, Load, steal, iowait, PSI, `vmstat`, socket summary, and recent kernel warnings. Root defaults to `/var/log/vps-health-monitor/monitor.log`, rotates the log at the configured size, and does not install a system service or persist across reboot.
+When an anomaly occurs, it records Top CPU/memory processes without full command arguments, D/Z state, Load, steal, iowait, PSI, `vmstat`, interface RX/TX rate, and socket state. It also probes `1.1.1.1` and `8.8.8.8` by default. A single target failure is recorded as a target event; only consecutive failure of every configured target produces an overall network `DOWN` event and a route, NIC, TCP, conntrack, qdisc, resolver, and kernel snapshot. Recovery produces a second snapshot.
+
+Targets and confirmation depth are configurable:
+
+```bash
+sudo bash /tmp/vps-health-monitor.sh start \
+  --target 1.1.1.1 --target 8.8.8.8 \
+  --network-failures 3
+```
+
+Root defaults to `/var/log/vps-health-monitor/monitor.log`, rotates the log at the configured size, and does not install a system service or persist across reboot.
 
 Import that log into a later evidence bundle:
 

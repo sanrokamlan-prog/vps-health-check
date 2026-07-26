@@ -7,6 +7,9 @@ All notable changes are documented in this file.
 - Added repeatable `--http` endpoint checks with HTTP status, DNS/connect/TLS/first-byte/total timings, redirect destination, remote address, and HTTPS certificate-expiry diagnostics.
 - Added repeatable `--dns` business-hostname checks with resolution timing and resolved-address evidence.
 - Redacted URL query strings and fragments from generated output, and rejected embedded URL credentials to avoid leaking endpoint secrets into evidence bundles.
+- Extended the unattended monitor with repeatable network targets, configurable consecutive-failure confirmation, target and overall `UP`/`DEGRADED`/`DOWN` events, and automatic outage/recovery network snapshots.
+- Added interface RX/TX rate heartbeats and outage evidence for routes, link counters, socket/TCP state, conntrack, qdisc, resolver state, and recent kernel warnings.
+- Required all configured targets to be down before recording an overall network outage, reducing false positives from one ICMP-filtered destination.
 
 ## 1.2.0 - 2026-07-26
 
