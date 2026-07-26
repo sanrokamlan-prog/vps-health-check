@@ -85,7 +85,10 @@ if command -v getent >/dev/null 2>&1; then
     grep -q 'DNS domain=localhost status=ok' "$bundle/raw/endpoints.txt"
 fi
 grep -q 'HTTP url=http://127.0.0.1:1/health code=000 status=connection-failed' "$bundle/raw/endpoints.txt"
-! grep -R -q 'must-not-leak' "$bundle"
+if grep -R -q 'must-not-leak' "$bundle"; then
+    printf 'URL query secret leaked into evidence bundle\n' >&2
+    exit 1
+fi
 grep -q 'External monitoring recorded 2 unreachable/lost events' "$bundle/provider-ticket-en.txt"
 grep -q '自动定责' "$ROOT_DIR/README.md"
 

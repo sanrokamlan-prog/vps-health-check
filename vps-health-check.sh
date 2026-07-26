@@ -1072,10 +1072,10 @@ check_dns_targets() {
 check_tls_expiry() {
     local url="$1" safe_url authority host port=443 remainder connect_host cert_end not_after end_epoch now_epoch days
     safe_url="$(redacted_url "$url")"
-    command_exists openssl && command_exists timeout || {
+    if ! command_exists openssl || ! command_exists timeout; then
         status_line INFO "$(tr_text '缺少 openssl 或 timeout，跳过 TLS 到期检查' 'openssl or timeout is unavailable; skipped TLS-expiry check'): $safe_url"
         return
-    }
+    fi
 
     authority="${url#https://}"
     authority="${authority%%/*}"
